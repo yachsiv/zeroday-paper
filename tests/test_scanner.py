@@ -423,19 +423,180 @@ async def test_run_one_cycle_flashalpha_exception_uses_self_computed(
     j.close()
 
 
-# ------------------------------------------------------ run_live_loop smoke
+# ------------------------------------------------------ run_live_loop
+
+
+class _FakeJournal:
+    def __init__(self):
+        self.closed = False
+        self.heartbeats: list[tuple[str, str]] = []
+
+    def close(self):
+        self.closed = True
+
+    def heartbeat(self, who: str, status: str = "ok"):
+        self.heartbeats.append((who, status))
+
+
+def _install_fake_journal(monkeypatch) -> _FakeJournal:
+    fake_j = _FakeJournal()
+    monkeypatch.setattr(sc, "Journal", lambda *a, **kw: fake_j)
+    return fake_j
+
+
+def _patch_now(monkeypatch, current_holder):
+    """Replace scanner.datetime with a shim that returns current_holder['t'] from .now()
+    while delegating everything else (combine, etc.) to the real datetime class.
+    """
+    from datetime import datetime as _real_datetime
+
+    class _PatchedDT(_real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_holder["t"]
+
+    monkeypatch.setattr(sc, "datetime", _PatchedDT)
 
 
 @pytest.mark.asyncio
-async def test_run_live_loop_outside_market_hours_returns(tmp_path, monkeypatch):
-    monkeypatch.setattr(sc, "is_market_hours_et", lambda *_: False)
+async def test_run_live_loop_weekend_returns_without_sleep(monkeypatch):
+    """Saturday at any time → returns immediately, never sleeps."""
+    fake_j = _install_fake_journal(monkeypatch)
 
-    class _FakeJournal:
-        def __init__(self): self.closed = False
-        def close(self): self.closed = True
-        def heartbeat(self, *_, **__): pass
+    saturday_morning = datetime(2025, 5, 31, 13, 30, tzinfo=UTC)  # Sat 09:30 ET
+    saturday_afternoon = datetime(2025, 5, 31, 20, 0, tzinfo=UTC)  # Sat 16:00 ET
 
-    fake_j = _FakeJournal()
-    monkeypatch.setattr(sc, "Journal", lambda *a, **kw: fake_j)
+    for fake_now in (saturday_morning, saturday_afternoon):
+        holder = {"t": fake_now}
+        _patch_now(monkeypatch, holder)
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(sc.asyncio, "sleep", sleep_mock)
+        run_cycle = AsyncMock(return_value={})
+        monkeypatch.setattr(sc, "run_one_cycle", run_cycle)
+
+        await sc.run_live_loop()
+        sleep_mock.assert_not_awaited()
+        run_cycle.assert_not_awaited()
+
+    assert fake_j.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_live_loop_pre_session_sleeps_then_runs_cycle(monkeypatch):
+    """Weekday 09:25 ET → sleeps with seconds > 0, heartbeats waiting_for_session."""
+    fake_j = _install_fake_journal(monkeypatch)
+
+    pre_session = datetime(2025, 5, 28, 13, 25, tzinfo=UTC)  # Wed 09:25 ET
+    in_session = datetime(2025, 5, 28, 13, 35, tzinfo=UTC)  # Wed 09:35 ET
+    after_session = datetime(2025, 5, 28, 20, 30, tzinfo=UTC)  # Wed 16:30 ET
+
+    times = iter([in_session, after_session])
+    current = {"t": pre_session}
+    _patch_now(monkeypatch, current)
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        try:
+            current["t"] = next(times)
+        except StopIteration:
+            pass
+
+    monkeypatch.setattr(sc.asyncio, "sleep", fake_sleep)
+
+    run_cycle = AsyncMock(return_value={"new_trades": 0, "monitored": 0, "exited": 0, "errors": 0})
+    monkeypatch.setattr(sc, "run_one_cycle", run_cycle)
+
     await sc.run_live_loop()
+
+    assert any(s > 0 for s in sleep_calls), f"expected a >0 pre-session sleep, got {sleep_calls}"
+    run_cycle.assert_awaited_once()
+    assert ("scanner", "waiting_for_session") in fake_j.heartbeats
+    assert fake_j.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_live_loop_after_session_logs_and_returns(monkeypatch, caplog):
+    """Weekday 16:30 ET (past session_end=16:00) → log after_session_exit + return."""
+    import logging as _logging
+    fake_j = _install_fake_journal(monkeypatch)
+
+    after = datetime(2025, 5, 28, 20, 30, tzinfo=UTC)  # Wed 16:30 ET
+    holder = {"t": after}
+    _patch_now(monkeypatch, holder)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(sc.asyncio, "sleep", sleep_mock)
+    run_cycle = AsyncMock(return_value={})
+    monkeypatch.setattr(sc, "run_one_cycle", run_cycle)
+
+    logged_events: list[str] = []
+    real_info = sc.logger.info
+
+    def _spy(event, *args, **kw):
+        logged_events.append(event)
+        return real_info(event, *args, **kw)
+
+    monkeypatch.setattr(sc.logger, "info", _spy)
+
+    await sc.run_live_loop()
+
+    assert "live.after_session_exit" in logged_events
+    run_cycle.assert_not_awaited()
+    sleep_mock.assert_not_awaited()
+    assert fake_j.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_live_loop_in_session_runs_cycle_then_after_session_exits(monkeypatch):
+    """Weekday in-session → run_one_cycle, then sleep interval, then advance to after-session."""
+    fake_j = _install_fake_journal(monkeypatch)
+
+    in_session = datetime(2025, 5, 28, 13, 35, tzinfo=UTC)  # Wed 09:35 ET
+    after = datetime(2025, 5, 28, 20, 30, tzinfo=UTC)  # Wed 16:30 ET
+
+    states = iter([after])
+    current = {"t": in_session}
+    _patch_now(monkeypatch, current)
+
+    async def fake_sleep(seconds):
+        try:
+            current["t"] = next(states)
+        except StopIteration:
+            pass
+
+    monkeypatch.setattr(sc.asyncio, "sleep", fake_sleep)
+    run_cycle = AsyncMock(return_value={"new_trades": 1, "monitored": 0, "exited": 0, "errors": 0})
+    monkeypatch.setattr(sc, "run_one_cycle", run_cycle)
+
+    await sc.run_live_loop()
+
+    run_cycle.assert_awaited_once()
+    assert fake_j.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_live_loop_cycle_exception_is_swallowed(monkeypatch):
+    """A cycle error should not crash the loop; heartbeats record the error."""
+    fake_j = _install_fake_journal(monkeypatch)
+
+    in_session = datetime(2025, 5, 28, 13, 35, tzinfo=UTC)
+    after = datetime(2025, 5, 28, 20, 30, tzinfo=UTC)
+
+    states = iter([after])
+    current = {"t": in_session}
+    _patch_now(monkeypatch, current)
+
+    async def fake_sleep(seconds):
+        try:
+            current["t"] = next(states)
+        except StopIteration:
+            pass
+
+    monkeypatch.setattr(sc.asyncio, "sleep", fake_sleep)
+    run_cycle = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(sc, "run_one_cycle", run_cycle)
+
+    await sc.run_live_loop()
+    assert any(s.startswith("error:") for _, s in fake_j.heartbeats)
     assert fake_j.closed is True

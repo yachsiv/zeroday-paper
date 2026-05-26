@@ -262,6 +262,7 @@ async def test_polygon_auth_error_403_propagates(monkeypatch):
             await c.get_minute_bar("O:X", datetime(2025, 5, 28, 14, 30, tzinfo=UTC))
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_polygon_5xx_retries_then_succeeds(monkeypatch):
     calls = {"n": 0}
@@ -279,6 +280,7 @@ async def test_polygon_5xx_retries_then_succeeds(monkeypatch):
         assert calls["n"] == 2
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_polygon_5xx_exhausts_retries_raises(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:

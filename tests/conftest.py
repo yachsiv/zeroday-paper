@@ -13,6 +13,12 @@ os.environ.setdefault("POLYGON_API_KEY", "test-polygon-key")
 os.environ.setdefault("FLASHALPHA_API_KEY", "test-flashalpha-key")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
 os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://discord.test/webhook")
+# Prevent any boto3/Secrets-Manager fallthrough during tests.
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "test-fake")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test-fake")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+# Belt-and-suspenders: signal metrics module to short-circuit if accidentally invoked
+os.environ.setdefault("ZP_METRICS_DISABLED", "1")
 
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -211,6 +217,23 @@ def tmp_journal(tmp_path) -> Journal:
         yield j
     finally:
         j.close()
+
+
+@pytest.fixture(autouse=True)
+def _silence_metrics(monkeypatch):
+    """Make zeroday_paper.metrics.emit a no-op in all tests by default.
+
+    Individual tests that need to assert metric emission can re-patch the
+    function on their own module reference.
+    """
+    try:
+        from zeroday_paper import metrics as _metrics
+        monkeypatch.setattr(_metrics, "emit", lambda *a, **kw: None)
+        # Also short-circuit client init so it never tries to reach boto3.
+        monkeypatch.setattr(_metrics, "_get_client", lambda: None)
+    except ImportError:
+        pass
+    yield
 
 
 def _make_paper_trade(

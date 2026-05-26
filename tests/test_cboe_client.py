@@ -98,6 +98,7 @@ async def test_cboe_get_live_snapshot_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_cboe_get_live_snapshot_partial_failure(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         if "VIX1D" in str(req.url):
@@ -164,6 +165,7 @@ async def test_cboe_historical_snapshot_no_date_column_returns_none(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_cboe_historical_csv_fetch_failure_returns_none(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(500)

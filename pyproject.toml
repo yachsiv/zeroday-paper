@@ -64,14 +64,14 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short --strict-markers"
+addopts = "-v --tb=short --strict-markers -m 'not slow and not integration'"
 asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
 markers = [
     "integration: hits live APIs",
-    "slow: slow tests",
+    "slow: tests >1s (retry-backoff, network mocks etc); skipped by default",
 ]
 
 [tool.coverage.run]
