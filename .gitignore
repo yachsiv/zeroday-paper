@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+zerovenv/
+env/
+
+# Local data
+data/*.duckdb
+data/*.duckdb.wal
+data/*.duckdb.tmp
+reports/*.html
+reports/*.md
+logs/*.log
+*.log
+
+# Secrets / local config
+.env
+.env.local
+*.pem
+
+# AWS / CDK
+cdk.out/
+.cdk.staging/
+node_modules/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Test artefacts
+.tox/
+.cache/
+coverage.xml

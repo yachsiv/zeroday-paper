@@ -1,0 +1,87 @@
+# zeroday-paper configuration. All runtime tunables.
+# Changes here do not require a code rebuild — only a container restart.
+
+[engine]
+poll_interval_seconds = 120                # 2-min cadence (vs main zeroday 15-min)
+score_threshold = 15                        # paper enters when score >= 15
+session_start = "09:30"
+session_end = "15:45"
+new_entry_cutoff = "13:30"                  # no new paper entries after 13:30 ET
+market_timezone = "America/New_York"
+warmup_minutes_after_open = 5               # observe first 5 min, do not trade
+
+[regime_gates]
+skip_negative_gex = true
+vix_1d_skip_threshold = 25.0
+cboe_skew_skip_threshold = 160.0
+rr25_skew_steepening_threshold_pp = 2.0     # if put IV rises >2pp vs call IV in 15min -> invalidate
+
+[strikes]
+default_short_delta_target = 0.18           # 18-delta short strike (Option Alpha default)
+default_short_delta_tolerance = 0.04
+default_spread_width = 25
+min_short_oi = 250
+min_long_oi = 100
+max_bid_ask_spread_dollars = 2.00
+
+[exits]
+profit_target_pre_11am = 0.75
+profit_target_11_to_1pm = 0.60
+profit_target_1_to_2pm = 0.50
+profit_target_after_2pm = 0.40
+stop_loss_multiple = 2.0                    # exit when loss = 2x credit received
+defensive_mode_start = "15:00"              # tighter targets after 3 PM
+hard_close = "15:45"
+
+[concurrency]
+max_concurrent_total = 6                    # cap across all strategy types
+max_bull_put_per_day = 3
+max_bear_call_per_day = 3
+max_iron_condor_per_day = 2
+min_minutes_between_same_strategy = 30
+
+[dedup]
+same_spread_window_minutes = 5              # do not relog same strikes within 5 min
+
+[replay]
+days_back = 365
+chunk_size_days = 30                        # one DuckDB transaction per 30-day chunk
+rate_limit_polygon_req_per_min = 60         # well under 300/min hard limit
+
+[patterns]
+layer_2_llm_enabled = true                  # Anthropic Claude classifier
+layer_2_min_confidence = 0.65               # only accept LLM patterns above this
+layer_2_max_calls_per_scan = 3              # cost cap per scan cycle
+layer_2_model = "claude-3-5-sonnet-20241022"
+layer_2_timeout_seconds = 8
+
+[storage]
+duckdb_path = "/data/paper.duckdb"          # EFS mount path on AWS
+duckdb_path_local = "./data/paper.duckdb"
+backup_to_s3 = true
+backup_bucket = "zeroday-paper-backup"
+backup_interval_minutes = 60
+schema_version = 1
+
+[reporting]
+daily_report_hour_et = 16
+daily_report_minute_et = 30
+discord_webhook_secret_key = "webhook_shadow"   # which key in zeroday/discord to use
+include_replay_summary_first_n_days = 7         # surface replay results for first week
+
+[alarms]
+scanner_silent_threshold_minutes = 30           # only alarm — fires if no journal write
+alarm_discord_webhook_secret_key = "webhook_monitor"
+
+[secrets]
+# All secret references point at existing zeroday secrets in Secrets Manager.
+# IAM role gets read-only access to these specific ARNs.
+polygon_secret_id = "zeroday/polygon"
+flashalpha_secret_id = "zeroday/flashalpha"
+anthropic_secret_id = "zeroday/anthropic"
+discord_secret_id = "zeroday/discord"
+
+[logging]
+level = "INFO"
+format = "json"                             # structured logs for CloudWatch
+no_alerts_during_day = true                 # explicit: no Discord per-trade
