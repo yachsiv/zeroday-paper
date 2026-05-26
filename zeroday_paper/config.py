@@ -144,6 +144,15 @@ class ReportingConfig:
     daily_report_minute_et: int
     discord_webhook_secret_key: str
     include_replay_summary_first_n_days: int
+    morning_brief_discord_webhook_secret_key: str
+    morning_brief_hour_et: int
+    morning_brief_minute_et: int
+
+
+@dataclass(frozen=True)
+class MorningBriefConfig:
+    enabled: bool
+    tier_one_events: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -158,6 +167,7 @@ class SecretsConfig:
     flashalpha_secret_id: str
     anthropic_secret_id: str
     discord_secret_id: str
+    perplexity_secret_id: str
 
 
 @dataclass(frozen=True)
@@ -179,6 +189,7 @@ class Settings:
     patterns: PatternsConfig
     storage: StorageConfig
     reporting: ReportingConfig
+    morning_brief: MorningBriefConfig
     alarms: AlarmsConfig
     secrets: SecretsConfig
     logging: LoggingConfig
@@ -223,6 +234,10 @@ def load_settings(path: Path | None = None) -> Settings:
         patterns=PatternsConfig(**raw["patterns"]),
         storage=StorageConfig(**raw["storage"]),
         reporting=ReportingConfig(**raw["reporting"]),
+        morning_brief=MorningBriefConfig(
+            enabled=bool(raw["morning_brief"]["enabled"]),
+            tier_one_events=tuple(raw["morning_brief"]["tier_one_events"]),
+        ),
         alarms=AlarmsConfig(**raw["alarms"]),
         secrets=SecretsConfig(**raw["secrets"]),
         logging=LoggingConfig(**raw["logging"]),

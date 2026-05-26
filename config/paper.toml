@@ -68,6 +68,14 @@ daily_report_hour_et = 16
 daily_report_minute_et = 30
 discord_webhook_secret_key = "webhook_shadow"   # which key in zeroday/discord to use
 include_replay_summary_first_n_days = 7         # surface replay results for first week
+morning_brief_discord_webhook_secret_key = "webhook_morning_brief"
+morning_brief_hour_et = 8                        # 08:00 ET cron, EDT half of the year
+morning_brief_minute_et = 0
+
+[morning_brief]
+enabled = true
+# Tier-1 macro events: if any falls within 09:30-14:00 ET, SKIP_TODAY=True.
+tier_one_events = ["FOMC", "CPI", "NFP", "PCE", "JOLTS"]
 
 [alarms]
 scanner_silent_threshold_minutes = 30           # only alarm — fires if no journal write
@@ -80,6 +88,7 @@ polygon_secret_id = "zeroday/polygon"
 flashalpha_secret_id = "zeroday/flashalpha"
 anthropic_secret_id = "zeroday/anthropic"
 discord_secret_id = "zeroday/discord"
+perplexity_secret_id = "zeroday/perplexity"
 
 [logging]
 level = "INFO"
