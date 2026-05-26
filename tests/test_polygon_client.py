@@ -17,6 +17,7 @@ from zeroday_paper.data.polygon_client import (
     PolygonClient,
     PolygonError,
     PolygonTransportError,
+    _derive_spot_from_chain,
     _safe_float,
     next_spx_expiry,
 )
@@ -408,10 +409,37 @@ async def test_polygon_get_chain_snapshot_paginates(monkeypatch):
     _install_transport(monkeypatch, handler)
     async with PolygonClient(api_key="x") as c:
         snap = await c.get_chain_snapshot(date(2025, 5, 28))
-    assert snap.spot == 5800.0
+    # Spot derived from put-call parity: 5800 + (1.1 - 0.6) = 5800.5
+    assert snap.spot == pytest.approx(5800.5)
     assert snap.total_quotes() == 2
     assert len(snap.calls) == 1
     assert len(snap.puts) == 1
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_chain_snapshot_with_spot_override_skips_derivation(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/v3/snapshot/options/" in str(req.url):
+            return httpx.Response(200, json={"results": [], "next_url": None})
+        return httpx.Response(404)
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        snap = await c.get_chain_snapshot(date(2025, 5, 28), spot_override=5912.0)
+    assert snap.spot == 5912.0
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_chain_snapshot_empty_chain_falls_back_to_zero(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/v3/snapshot/options/" in str(req.url):
+            return httpx.Response(200, json={"results": [], "next_url": None})
+        return httpx.Response(404)
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        snap = await c.get_chain_snapshot(date(2025, 5, 28))
+    assert snap.spot == 0.0
 
 
 @pytest.mark.asyncio
@@ -432,24 +460,28 @@ async def test_polygon_get_chain_snapshot_uses_spot_override(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_polygon_get_chain_snapshot_at_reconstructs_bars(monkeypatch):
+    chain_results = [
+        {
+            "details": {"ticker": "O:C", "strike_price": 5800, "contract_type": "call"},
+            "last_quote": {"bid": 1.0, "ask": 1.2},
+            "open_interest": 100, "day": {"volume": 50},
+            "greeks": {"delta": 0.5, "gamma": 0.01, "theta": -0.5, "vega": 0.2},
+            "implied_volatility": 0.21,
+        },
+        {
+            "details": {"ticker": "O:P", "strike_price": 5800, "contract_type": "put"},
+            "last_quote": {"bid": 0.5, "ask": 0.7},
+            "open_interest": 100, "day": {"volume": 50},
+            "greeks": {"delta": -0.5},
+            "implied_volatility": 0.21,
+        },
+    ]
+
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        if "/v2/aggs/ticker/I:SPX/" in path:
-            return httpx.Response(200, json={"results": [{"c": 5800.0}]})
         if "/v3/snapshot/options/" in path:
-            return httpx.Response(200, json={
-                "results": [
-                    {
-                        "details": {"ticker": "O:Z", "strike_price": 5800, "contract_type": "call"},
-                        "last_quote": {"bid": 1.0, "ask": 1.2},
-                        "open_interest": 100, "day": {"volume": 50},
-                        "greeks": {"delta": 0.5, "gamma": 0.01, "theta": -0.5, "vega": 0.2},
-                        "implied_volatility": 0.21,
-                    },
-                ],
-                "next_url": None,
-            })
-        if "/v2/aggs/ticker/O:Z/" in path:
+            return httpx.Response(200, json={"results": chain_results, "next_url": None})
+        if "/v2/aggs/ticker/O:" in path:
             return httpx.Response(200, json={"results": [{"o": 2, "h": 3, "l": 2, "c": 2.5, "v": 10}]})
         return httpx.Response(404)
 
@@ -458,32 +490,29 @@ async def test_polygon_get_chain_snapshot_at_reconstructs_bars(monkeypatch):
         snap = await c.get_chain_snapshot_at(
             date(2025, 5, 28), datetime(2025, 5, 28, 14, 30, tzinfo=UTC)
         )
-    assert snap.spot == 5800.0
+    # After bar reconstruction (close=2.5 on both legs), put-call parity → 5800 + 0 = 5800
+    assert snap.spot == pytest.approx(5800.0)
     assert len(snap.calls) == 1
-    # The call should have been re-priced from the minute bar (close=2.5)
     assert snap.calls[0].mid == 2.5
     assert snap.calls[0].bid >= 0.0
 
 
 @pytest.mark.asyncio
 async def test_polygon_get_chain_snapshot_at_skips_missing_bar(monkeypatch):
+    chain_results = [
+        {
+            "details": {"ticker": "O:C", "strike_price": 5800, "contract_type": "call"},
+            "last_quote": {"bid": 1.0, "ask": 1.2},
+            "open_interest": 100, "day": {"volume": 50},
+            "greeks": {"delta": 0.5},
+            "implied_volatility": 0.21,
+        },
+    ]
+
     def handler(req: httpx.Request) -> httpx.Response:
         path = req.url.path
-        if "/v2/aggs/ticker/I:SPX/" in path:
-            return httpx.Response(200, json={"results": [{"c": 5800.0}]})
         if "/v3/snapshot/options/" in path:
-            return httpx.Response(200, json={
-                "results": [
-                    {
-                        "details": {"ticker": "O:Z", "strike_price": 5800, "contract_type": "call"},
-                        "last_quote": {"bid": 1.0, "ask": 1.2},
-                        "open_interest": 100, "day": {"volume": 50},
-                        "greeks": {"delta": 0.5},
-                        "implied_volatility": 0.21,
-                    },
-                ],
-                "next_url": None,
-            })
+            return httpx.Response(200, json={"results": chain_results, "next_url": None})
         # All minute bars return empty
         return httpx.Response(200, json={"results": []})
 
@@ -495,3 +524,48 @@ async def test_polygon_get_chain_snapshot_at_skips_missing_bar(monkeypatch):
     # contract preserved (not None) but bid/ask unchanged
     assert len(snap.calls) == 1
     assert snap.calls[0].mid == 1.1  # original mid from chain
+
+
+# ----------------------------------------------------- _derive_spot_from_chain
+
+
+def test_derive_spot_from_chain_returns_none_when_no_overlap(make_quote):
+    calls = [make_quote(strike=5800, right="C", bid=1.0, ask=1.2)]
+    puts = [make_quote(strike=5700, right="P", bid=0.5, ask=0.7)]
+    assert _derive_spot_from_chain(calls, puts) is None
+
+
+def test_derive_spot_from_chain_empty_returns_none():
+    assert _derive_spot_from_chain([], []) is None
+
+
+def test_derive_spot_from_chain_zero_mids_skipped(make_quote):
+    calls = [make_quote(strike=5800, right="C", bid=0.0, ask=0.0)]
+    puts = [make_quote(strike=5800, right="P", bid=0.0, ask=0.0)]
+    # Both have mid=0 after construction → filtered out
+    assert _derive_spot_from_chain(calls, puts) is None
+
+
+def test_derive_spot_from_chain_uses_put_call_parity(make_quote):
+    calls = [make_quote(strike=5800, right="C", bid=1.0, ask=1.2, open_interest=500)]
+    puts = [make_quote(strike=5800, right="P", bid=0.6, ask=0.8, open_interest=500)]
+    spot = _derive_spot_from_chain(calls, puts)
+    # spot ≈ 5800 + (1.1 - 0.7) = 5800.4
+    assert spot == pytest.approx(5800.4)
+
+
+def test_derive_spot_from_chain_takes_median_across_strikes(make_quote):
+    # Multiple strike pairs with slightly different spot estimates
+    calls = [
+        make_quote(strike=5790, right="C", bid=11.0, ask=11.2, open_interest=500),
+        make_quote(strike=5800, right="C", bid=1.0, ask=1.2, open_interest=500),
+        make_quote(strike=5810, right="C", bid=0.05, ask=0.10, open_interest=500),
+    ]
+    puts = [
+        make_quote(strike=5790, right="P", bid=0.05, ask=0.10, open_interest=500),
+        make_quote(strike=5800, right="P", bid=1.0, ask=1.2, open_interest=500),
+        make_quote(strike=5810, right="P", bid=10.0, ask=10.5, open_interest=500),
+    ]
+    spot = _derive_spot_from_chain(calls, puts)
+    assert spot is not None
+    assert 5790 <= spot <= 5810
