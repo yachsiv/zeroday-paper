@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from zeroday_paper.config import settings
 from zeroday_paper.engine import gex_patterns_llm as llm
 from zeroday_paper.engine.gex_patterns_llm import (
     LLMBudget,
@@ -18,6 +19,35 @@ from zeroday_paper.engine.gex_patterns_llm import (
     classify_layer2,
     state_to_summary,
 )
+
+# Anthropic model ids that have been live-probed against the Messages API and
+# confirmed reachable (probe done 2026-05-26 after the stale `claude-3-5-sonnet-
+# 20241022` started returning 404 in production). When raising the configured
+# model, add the new id here and run a probe against the live API.
+KNOWN_GOOD_ANTHROPIC_MODELS = {
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-20250514",
+    "claude-3-5-sonnet-latest",
+}
+
+# Model ids known to return 404 not_found_error. Regression test below blocks
+# accidentally restoring them in `config/paper.toml`.
+KNOWN_BAD_ANTHROPIC_MODELS = {
+    "claude-3-5-sonnet-20241022",
+}
+
+
+def test_configured_model_is_known_good():
+    """Regression: paper.toml's layer_2_model must be in the live-probed set."""
+    configured = settings.patterns.layer_2_model
+    assert configured in KNOWN_GOOD_ANTHROPIC_MODELS, (
+        f"layer_2_model={configured!r} is not in the known-good set; "
+        "probe against the Anthropic Messages API and add it before deploying."
+    )
+    assert configured not in KNOWN_BAD_ANTHROPIC_MODELS, (
+        f"layer_2_model={configured!r} is in the known-404 set."
+    )
 
 
 # ----------------------------------------------------------------- pure helpers
@@ -271,6 +301,47 @@ async def test_classify_layer2_api_error(make_state, monkeypatch):
     monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
     out = await classify_layer2(make_state())
     assert out == []
+
+
+@pytest.mark.asyncio
+async def test_classify_layer2_passes_configured_model_to_anthropic(make_state, monkeypatch):
+    """Regression: AsyncAnthropic.messages.create must be invoked with the
+    exact model id loaded from paper.toml.
+
+    Catches the May 2026 outage shape: a stale model name in TOML would silently
+    404 every cycle even though the SDK + key were healthy. We assert the live
+    model id is forwarded into ``create`` so renaming the TOML field flips the
+    test red.
+    """
+    captured: dict[str, object] = {}
+
+    class _Block:
+        type = "text"
+        text = '{"matches": []}'
+
+    @dataclass
+    class _Resp:
+        content: list
+
+    class _Messages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return _Resp(content=[_Block()])
+
+    class _AsyncAnthropic:
+        def __init__(self, api_key=None):
+            self.messages = _Messages()
+
+    fake_mod = types.ModuleType("anthropic")
+    fake_mod.AsyncAnthropic = _AsyncAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
+    monkeypatch.setattr(llm, "anthropic_api_key", lambda: "test-key")
+
+    await classify_layer2(make_state())
+
+    assert "model" in captured
+    assert captured["model"] == settings.patterns.layer_2_model
+    assert captured["model"] in KNOWN_GOOD_ANTHROPIC_MODELS
 
 
 @pytest.mark.asyncio

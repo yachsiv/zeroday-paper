@@ -1,35 +1,31 @@
 """FlashAlpha client (zero_dte + exposure_levels).
 
-Wraps the `flashalpha` Python SDK if available; falls back to bare HTTP if not.
-Surfaces a single `get_signals(symbol)` returning a `MarketSignals` snapshot used
-by the scorer and pattern classifier.
+Wraps the official ``flashalpha`` Python SDK and exposes an ``async`` surface
+matching the rest of the scanner. The previous bare-HTTP implementation
+targeted a base URL (``api.flashalpha.io``) that does not exist; FlashAlpha
+distributes the SDK as the only supported client. See the parent
+``zeroday-trading`` repo (``agents/flashalpha_client.py``) for the canonical
+field mapping.
 
-For replay (no historical FlashAlpha endpoint in the free tier), `get_signals_at`
-self-computes gamma flip / pin score from the Polygon chain. This keeps replay
-leak-free.
+For replay (no historical FlashAlpha endpoint in the free tier),
+``signals_from_chain`` self-computes gamma flip / pin score from the Polygon
+chain. The same path is used in live mode if FlashAlpha is unreachable or
+the SDK is not installed, so the scanner never hard-fails on FA outages.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import structlog
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from zeroday_paper.data.polygon_client import ChainSnapshot
 from zeroday_paper.secrets import flashalpha_api_key
 
 logger = structlog.get_logger(__name__)
-
-FLASHALPHA_BASE = "https://api.flashalpha.io"
 
 
 class FlashAlphaError(RuntimeError):
@@ -58,79 +54,107 @@ class MarketSignals:
 
 
 class FlashAlphaClient:
-    """Async client for FlashAlpha REST API.
+    """Async wrapper around the synchronous ``flashalpha`` SDK.
 
-    The SDK is dropped in favor of a direct REST shim — keeps this repo's
-    dependency surface minimal.
+    The SDK ships a single ``FlashAlpha(api_key)`` factory exposing
+    ``zero_dte(symbol)`` and ``exposure_levels(symbol)``. We invoke both
+    via ``asyncio.to_thread`` so the scanner's event loop stays unblocked.
+
+    Construction never touches the network; the SDK is lazy-imported in
+    ``__aenter__`` so unit tests that monkey-patch ``flashalpha`` keep
+    working and a missing SDK raises ``FlashAlphaError`` (which the
+    scanner already handles with a self-compute fallback).
     """
 
     def __init__(self, api_key: str | None = None, timeout: float = 8.0):
-        self._api_key = api_key or flashalpha_api_key()
+        self._api_key = api_key
         self._timeout = timeout
-        self._client: httpx.AsyncClient | None = None
+        self._fa: Any | None = None
 
     async def __aenter__(self) -> "FlashAlphaClient":
-        self._client = httpx.AsyncClient(
-            base_url=FLASHALPHA_BASE,
-            timeout=self._timeout,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "User-Agent": "zeroday-paper/0.1",
-            },
-        )
+        if self._fa is not None:
+            return self
+        try:
+            from flashalpha import FlashAlpha  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise FlashAlphaError(
+                "flashalpha SDK not installed; run `uv sync` to install"
+            ) from exc
+        api_key = self._api_key or flashalpha_api_key()
+        self._fa = FlashAlpha(api_key)
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        self._fa = None
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        assert self._client is not None
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TransportError, httpx.TimeoutException)),
-            reraise=True,
-        ):
-            with attempt:
-                resp = await self._client.get(path, params=params or {})
-                if resp.status_code in (401, 403):
-                    raise FlashAlphaError(f"auth failed: {resp.status_code}")
-                resp.raise_for_status()
-                return resp.json()
-        raise FlashAlphaError(f"unreachable for {path}")  # pragma: no cover
+    async def _call(self, method: str, symbol: str) -> dict[str, Any]:
+        if self._fa is None:  # pragma: no cover - defensive
+            raise FlashAlphaError("client not initialised; use `async with`")
+        fn = getattr(self._fa, method)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(fn, symbol), timeout=self._timeout
+            )
+        except asyncio.TimeoutError as exc:
+            raise FlashAlphaError(f"{method} timeout after {self._timeout}s") from exc
+        except Exception as exc:
+            raise FlashAlphaError(f"{method} failed: {exc}") from exc
+        if not isinstance(result, dict):  # pragma: no cover - SDK contract
+            raise FlashAlphaError(f"{method} returned {type(result).__name__}, expected dict")
+        return result
 
     async def get_signals(self, symbol: str = "SPX") -> MarketSignals:
-        """Live signals via two calls: zero_dte + exposure_levels."""
-        zd = await self._get("/v1/zero_dte", params={"symbol": symbol})
-        ex = await self._get("/v1/exposure_levels", params={"symbol": symbol})
+        """Live signals via two SDK calls: zero_dte + exposure_levels."""
+        zd = await self._call("zero_dte", symbol)
+        ex = await self._call("exposure_levels", symbol)
 
-        regime_raw = (zd.get("gamma_regime") or "").lower()
-        if "pos" in regime_raw:
-            regime = "positive_gamma"
-        elif "neg" in regime_raw:
-            regime = "negative_gamma"
+        regime = (zd.get("regime") or {}) if isinstance(zd.get("regime"), dict) else {}
+        regime_label = str(regime.get("label") or zd.get("gamma_regime") or "").lower()
+        if "pos" in regime_label:
+            gamma_regime = "positive_gamma"
+        elif "neg" in regime_label:
+            gamma_regime = "negative_gamma"
         else:
-            regime = "neutral"
+            gamma_regime = "neutral"
+
+        pin = zd.get("pin_risk") or {}
+        em = zd.get("expected_move") or {}
+        lvls = ex.get("levels") or {}
+        exposures = zd.get("exposures") or {}
+
+        spot = _f(zd.get("underlying_price") or zd.get("spot")) or 0.0
+
+        # 0DTE gamma_flip from regime; broad-chain gamma_flip from exposure_levels.
+        # Prefer the chain-wide flip for the scanner since the scorer compares
+        # against current spot (zero_dte gamma_flip ≈ spot near close).
+        gamma_flip = _f(lvls.get("gamma_flip")) or _f(regime.get("gamma_flip"))
+
+        total_chain_gex_dollars = _f(exposures.get("total_chain_net_gex"))
+        total_gex_b: float | None = None
+        if total_chain_gex_dollars is not None:
+            total_gex_b = total_chain_gex_dollars / 1e9
+
+        zero_dte_share = _f(exposures.get("pct_of_total_gex"))
+        if zero_dte_share is not None:
+            zero_dte_share = zero_dte_share / 100.0
 
         return MarketSignals(
             fetched_at=datetime.now(UTC),
             source="flashalpha",
             symbol=symbol,
-            spot=float(zd.get("spot") or zd.get("underlying_price") or 0.0),
-            gamma_regime=regime,
-            gamma_flip=_f(ex.get("gamma_flip") or zd.get("gamma_flip")),
-            call_wall=_f(ex.get("call_wall")),
-            put_wall=_f(ex.get("put_wall")),
-            max_pain=_f(ex.get("max_pain") or zd.get("max_pain")),
-            magnet_strike=_f(zd.get("magnet_strike")),
-            pin_score=_f(zd.get("pin_score")),
-            zero_dte_gex_share=_f(zd.get("zero_dte_gex_share")),
-            remaining_1sd=_f(zd.get("remaining_1sd")),
-            full_day_1sd=_f(zd.get("full_day_1sd")),
-            hours_remaining=_f(zd.get("hours_remaining")),
-            total_gex=_f(ex.get("total_gex")),
+            spot=spot,
+            gamma_regime=gamma_regime,
+            gamma_flip=gamma_flip,
+            call_wall=_f(lvls.get("call_wall")),
+            put_wall=_f(lvls.get("put_wall")),
+            max_pain=_f(pin.get("max_pain")),
+            magnet_strike=_f(pin.get("magnet_strike") or lvls.get("zero_dte_magnet")),
+            pin_score=_f(pin.get("pin_score")),
+            zero_dte_gex_share=zero_dte_share,
+            remaining_1sd=_f(em.get("remaining_1sd_dollars")),
+            full_day_1sd=_f(em.get("implied_1sd_dollars")),
+            hours_remaining=_f(zd.get("time_to_close_hours")),
+            total_gex=total_gex_b,
             raw={"zero_dte": zd, "exposure_levels": ex},
         )
 

@@ -489,6 +489,18 @@ wheels = [
 ]
 
 [[package]]
+name = "flashalpha"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/b1/207643629a2cc937118a4d1fc3a03c1da16f9ed960c65ba4bd08d7c40985/flashalpha-1.0.1.tar.gz", hash = "sha256:a6e32683d8b294e4042946c7cbc760e50ceec18a3959697ba6109f43e9120565", size = 52479, upload-time = "2026-05-23T08:42:41.697Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/42/9fd749df0a29ab9dc08239c6675becc0b6256b6b70eecb718e8fdf978b89/flashalpha-1.0.1-py3-none-any.whl", hash = "sha256:4c040779d3db60aa1dc4cb525f7ba177affcb27fe747852c90ad89a82fdc304c", size = 51439, upload-time = "2026-05-23T08:42:40.102Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1446,6 +1458,7 @@ dependencies = [
     { name = "boto3" },
     { name = "discord-webhook" },
     { name = "duckdb" },
+    { name = "flashalpha" },
     { name = "httpx" },
     { name = "numpy" },
     { name = "polars" },
@@ -1478,6 +1491,7 @@ requires-dist = [
     { name = "constructs", marker = "extra == 'cdk'", specifier = ">=10.3" },
     { name = "discord-webhook", specifier = ">=1.3" },
     { name = "duckdb", specifier = ">=1.1" },
+    { name = "flashalpha", specifier = ">=1.0,<2.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.26" },

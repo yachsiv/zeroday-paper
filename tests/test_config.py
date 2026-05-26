@@ -45,7 +45,9 @@ def test_parse_hhmm():
 def test_load_settings_default():
     s = cfg.load_settings()
     assert s.engine.poll_interval_seconds == 120
-    assert s.engine.score_threshold == 15
+    # Lowered 15 → 13 on 2026-05-26 (paper warmup window). See score_threshold
+    # TODO in config/paper.toml + test_score.py::test_score_threshold_is_13_*.
+    assert s.engine.score_threshold == 13
     assert s.engine.market_timezone == "America/New_York"
     assert s.exits.stop_loss_multiple == 2.0
 

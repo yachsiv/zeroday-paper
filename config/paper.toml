@@ -3,7 +3,10 @@
 
 [engine]
 poll_interval_seconds = 120                # 2-min cadence (vs main zeroday 15-min)
-score_threshold = 15                        # paper enters when score >= 15
+# TODO(zeroday-paper): raise back to 15 once we have ≥30 paper trades to evaluate
+# quality. Lowered from 15 → 13 on 2026-05-26 to start collecting trades while
+# FlashAlpha (was DNS-broken) and Anthropic (was 404 on stale model id) recover.
+score_threshold = 13                        # paper enters when score >= 13 (first 5 days)
 session_start = "09:30"
 session_end = "15:45"
 new_entry_cutoff = "13:30"                  # no new paper entries after 13:30 ET
@@ -52,7 +55,16 @@ rate_limit_polygon_req_per_min = 60         # well under 300/min hard limit
 layer_2_llm_enabled = true                  # Anthropic Claude classifier
 layer_2_min_confidence = 0.65               # only accept LLM patterns above this
 layer_2_max_calls_per_scan = 3              # cost cap per scan cycle
-layer_2_model = "claude-3-5-sonnet-20241022"
+# Resolved 2026-05-26 by live probe against Anthropic Messages API.
+# `claude-3-5-sonnet-20241022` started returning 404 not_found_error in May 2026
+# (we observed it on every paper scan cycle from 09:28-15:45 ET). The candidate
+# list (probed in order) was:
+#   claude-sonnet-4-5            ← FIRST OK (use this)
+#   claude-sonnet-4-5-20250929   (not tried — short-circuited on success above)
+#   claude-sonnet-4-20250514     (not tried)
+#   claude-3-5-sonnet-latest     (not tried)
+#   claude-3-5-sonnet-20241022   (KNOWN 404 — do not re-introduce)
+layer_2_model = "claude-sonnet-4-5"
 layer_2_timeout_seconds = 8
 
 [storage]

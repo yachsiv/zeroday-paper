@@ -1,18 +1,17 @@
-"""FlashAlpha client + self-computed signals from chain."""
+"""FlashAlpha client (SDK-wrapped) + self-computed signals from chain."""
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import UTC, datetime
-from typing import Callable
 
-import httpx
 import pytest
 
 from zeroday_paper.data import flashalpha_client as fa
 from zeroday_paper.data.flashalpha_client import (
     FlashAlphaClient,
     FlashAlphaError,
-    MarketSignals,
     _approx_gamma_flip,
     _approx_magnet,
     _approx_max_pain,
@@ -24,14 +23,68 @@ from zeroday_paper.data.flashalpha_client import (
 from zeroday_paper.data.polygon_client import ChainSnapshot
 
 
-def _install_transport(monkeypatch, handler):
-    real_asyncclient = httpx.AsyncClient
+# --------------------------------------------------------------------- SDK mock
+#
+# The production FlashAlphaClient now wraps the official ``flashalpha`` Python
+# SDK (sync) via ``asyncio.to_thread``. We install a fake ``flashalpha`` module
+# whose ``FlashAlpha`` factory returns a stub exposing ``zero_dte`` and
+# ``exposure_levels`` — exactly the surface the client touches.
 
-    def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
-        return real_asyncclient(*args, **kwargs)
 
-    monkeypatch.setattr(fa.httpx, "AsyncClient", fake_async_client)
+def _install_sdk_mock(monkeypatch, *, zero_dte=None, exposure_levels=None, raise_on=None):
+    """Install a fake ``flashalpha.FlashAlpha`` with deterministic payloads.
+
+    ``raise_on`` is one of ``None | "zero_dte" | "exposure_levels"``; matching
+    method raises a fake SDK error instead of returning data.
+    """
+    zero_dte_payload = zero_dte if zero_dte is not None else {
+        "underlying_price": 7519.12,
+        "regime": {
+            "label": "positive_gamma",
+            "gamma_flip": 7518.71,
+        },
+        "pin_risk": {
+            "magnet_strike": 7515,
+            "pin_score": 85,
+            "max_pain": 6960,
+        },
+        "expected_move": {
+            "implied_1sd_dollars": 51.7,
+            "remaining_1sd_dollars": 12.3,
+        },
+        "vol_context": {"vix": 18.3},
+        "time_to_close_hours": 4.0,
+        "exposures": {
+            "pct_of_total_gex": 36.9,
+            "total_chain_net_gex": 5.022e9,
+        },
+    }
+    exposure_payload = exposure_levels if exposure_levels is not None else {
+        "levels": {
+            "gamma_flip": 7399.51,
+            "call_wall": 8200,
+            "put_wall": 7395,
+            "zero_dte_magnet": 7515,
+        },
+    }
+
+    class _StubFA:
+        def __init__(self, api_key):
+            self.api_key = api_key
+
+        def zero_dte(self, symbol):
+            if raise_on == "zero_dte":
+                raise RuntimeError("sdk boom (zero_dte)")
+            return zero_dte_payload
+
+        def exposure_levels(self, symbol):
+            if raise_on == "exposure_levels":
+                raise RuntimeError("sdk boom (exposure_levels)")
+            return exposure_payload
+
+    fake_mod = types.ModuleType("flashalpha")
+    fake_mod.FlashAlpha = _StubFA
+    monkeypatch.setitem(sys.modules, "flashalpha", fake_mod)
 
 
 # ----------------------------------------------------------------- _f helper
@@ -51,60 +104,42 @@ def test_f_invalid():
     assert _f({}) is None
 
 
-# --------------------------------------------------------------- HTTP behavior
+# ---------------------------------------------------------------- SDK behavior
 
 
 @pytest.mark.asyncio
 async def test_flashalpha_get_signals_success(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        path = req.url.path
-        # Verify auth header
-        assert req.headers["authorization"].startswith("Bearer ")
-        if path == "/v1/zero_dte":
-            return httpx.Response(200, json={
-                "spot": 5800.0,
-                "gamma_regime": "Positive Gamma",
-                "magnet_strike": 5800.0,
-                "pin_score": 70.0,
-                "zero_dte_gex_share": 0.7,
-                "remaining_1sd": 20.0,
-                "full_day_1sd": 40.0,
-                "hours_remaining": 4.0,
-                "max_pain": 5805.0,
-            })
-        if path == "/v1/exposure_levels":
-            return httpx.Response(200, json={
-                "gamma_flip": 5790.0,
-                "call_wall": 5850.0,
-                "put_wall": 5750.0,
-                "total_gex": 2.0,
-            })
-        return httpx.Response(404)
-
-    _install_transport(monkeypatch, handler)
+    _install_sdk_mock(monkeypatch)
     async with FlashAlphaClient(api_key="test") as c:
         signals = await c.get_signals("SPX")
 
     assert signals.source == "flashalpha"
-    assert signals.spot == 5800.0
+    assert signals.spot == 7519.12
     assert signals.gamma_regime == "positive_gamma"
-    assert signals.gamma_flip == 5790.0
-    assert signals.call_wall == 5850.0
-    assert signals.put_wall == 5750.0
-    assert signals.pin_score == 70.0
-    assert signals.total_gex == 2.0
+    # exposure_levels.gamma_flip preferred over regime.gamma_flip
+    assert signals.gamma_flip == 7399.51
+    assert signals.call_wall == 8200.0
+    assert signals.put_wall == 7395.0
+    assert signals.pin_score == 85.0
+    assert signals.magnet_strike == 7515.0
+    assert signals.max_pain == 6960.0
+    # total_chain_net_gex (dollars) → billions
+    assert signals.total_gex == pytest.approx(5.022, rel=1e-3)
+    # pct_of_total_gex (0..100) → 0..1
+    assert signals.zero_dte_gex_share == pytest.approx(0.369, rel=1e-3)
+    assert signals.remaining_1sd == 12.3
+    assert signals.full_day_1sd == 51.7
+    assert signals.hours_remaining == 4.0
     assert signals.raw is not None
-    assert "zero_dte" in signals.raw
+    assert "zero_dte" in signals.raw and "exposure_levels" in signals.raw
 
 
 @pytest.mark.asyncio
 async def test_flashalpha_negative_gamma_parsed(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/v1/zero_dte":
-            return httpx.Response(200, json={"spot": 5800, "gamma_regime": "Negative GEX"})
-        return httpx.Response(200, json={})
-
-    _install_transport(monkeypatch, handler)
+    _install_sdk_mock(monkeypatch, zero_dte={
+        "underlying_price": 5800.0,
+        "regime": {"label": "Negative_Gamma"},
+    })
     async with FlashAlphaClient(api_key="test") as c:
         signals = await c.get_signals()
     assert signals.gamma_regime == "negative_gamma"
@@ -112,50 +147,72 @@ async def test_flashalpha_negative_gamma_parsed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_flashalpha_neutral_regime_when_unknown(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/v1/zero_dte":
-            return httpx.Response(200, json={"spot": 5800, "gamma_regime": "?"})
-        return httpx.Response(200, json={})
-
-    _install_transport(monkeypatch, handler)
+    _install_sdk_mock(monkeypatch, zero_dte={
+        "underlying_price": 5800.0,
+        "regime": {"label": "?"},
+    })
     async with FlashAlphaClient(api_key="test") as c:
         signals = await c.get_signals()
     assert signals.gamma_regime == "neutral"
 
 
 @pytest.mark.asyncio
-async def test_flashalpha_auth_error_on_401(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": "bad key"})
-
-    _install_transport(monkeypatch, handler)
+async def test_flashalpha_zero_dte_failure_raises(monkeypatch):
+    _install_sdk_mock(monkeypatch, raise_on="zero_dte")
     async with FlashAlphaClient(api_key="test") as c:
         with pytest.raises(FlashAlphaError):
             await c.get_signals()
 
 
 @pytest.mark.asyncio
-async def test_flashalpha_auth_error_on_403(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": "forbidden"})
-
-    _install_transport(monkeypatch, handler)
+async def test_flashalpha_exposure_levels_failure_raises(monkeypatch):
+    _install_sdk_mock(monkeypatch, raise_on="exposure_levels")
     async with FlashAlphaClient(api_key="test") as c:
         with pytest.raises(FlashAlphaError):
             await c.get_signals()
 
 
 @pytest.mark.asyncio
-async def test_flashalpha_spot_fallback_to_underlying_price(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/v1/zero_dte":
-            return httpx.Response(200, json={"underlying_price": 5810, "gamma_regime": "positive"})
-        return httpx.Response(200, json={})
-
-    _install_transport(monkeypatch, handler)
+async def test_flashalpha_spot_fallback_to_spot_key(monkeypatch):
+    # SDK has historically used both `underlying_price` and `spot`; ensure we
+    # tolerate the legacy key.
+    _install_sdk_mock(monkeypatch, zero_dte={
+        "spot": 5810.0,
+        "regime": {"label": "positive_gamma"},
+    })
     async with FlashAlphaClient(api_key="test") as c:
         signals = await c.get_signals()
     assert signals.spot == 5810.0
+
+
+@pytest.mark.asyncio
+async def test_flashalpha_missing_sdk_raises(monkeypatch):
+    # Force the lazy ``from flashalpha import FlashAlpha`` to fail.
+    monkeypatch.setitem(sys.modules, "flashalpha", None)
+    with pytest.raises(FlashAlphaError):
+        async with FlashAlphaClient(api_key="test"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_flashalpha_falls_back_to_regime_flip_when_levels_blank(monkeypatch):
+    _install_sdk_mock(monkeypatch, exposure_levels={"levels": {}})
+    async with FlashAlphaClient(api_key="test") as c:
+        signals = await c.get_signals()
+    # Falls through to regime.gamma_flip from the canned zero_dte payload
+    assert signals.gamma_flip == 7518.71
+
+
+@pytest.mark.asyncio
+async def test_flashalpha_handles_missing_exposures_block(monkeypatch):
+    _install_sdk_mock(monkeypatch, zero_dte={
+        "underlying_price": 5800.0,
+        "regime": {"label": "positive_gamma"},
+    })
+    async with FlashAlphaClient(api_key="test") as c:
+        signals = await c.get_signals()
+    assert signals.total_gex is None
+    assert signals.zero_dte_gex_share is None
 
 
 # --------------------------------------------------------- signals_from_chain
@@ -190,7 +247,6 @@ def test_signals_from_chain_zero_spot_returns_empty(make_chain):
 
 def test_signals_from_chain_skips_quotes_with_no_gamma(make_chain):
     chain = make_chain()
-    # Build a new chain with all gamma stripped → call_gex/put_gex empty
     blank_calls = [
         type(q)(
             contract=q.contract, strike=q.strike, right=q.right, expiry=q.expiry,
@@ -215,7 +271,7 @@ def test_signals_from_chain_skips_quotes_with_no_gamma(make_chain):
     )
     signals = signals_from_chain(chain_no_gamma)
     assert signals.total_gex == 0.0
-    assert signals.call_wall is None  # empty call_gex dict
+    assert signals.call_wall is None
     assert signals.put_wall is None
 
 
@@ -234,7 +290,6 @@ def test_approx_gamma_flip_finds_sign_change():
     cgex = {5790.0: 1.0, 5800.0: 2.0, 5810.0: 1.0}
     pgex = {5790.0: 0.5, 5800.0: 3.0, 5810.0: 1.0}
     flip = _approx_gamma_flip(cgex, pgex)
-    # net@5790 = 0.5, net@5800 = -1.0 → sign change at 5800
     assert flip == 5800.0
 
 
@@ -272,7 +327,6 @@ def test_approx_magnet_zero_spot():
 
 def test_approx_magnet_no_oi_in_band(make_chain, make_quote):
     chain = make_chain()
-    # Replace all calls/puts so none have strikes within ±50 of spot.
     far_calls = [make_quote(strike=5000, right="C", open_interest=100)]
     far_puts = [make_quote(strike=5000, right="P", open_interest=100)]
     chain2 = type(chain)(
@@ -284,9 +338,7 @@ def test_approx_magnet_no_oi_in_band(make_chain, make_quote):
 
 def test_approx_pin_score():
     assert _approx_pin_score(5800.0, 5800.0) == 100.0
-    # 5pt diff → 100 - 5*4 = 80
     assert _approx_pin_score(5805.0, 5800.0) == 80.0
-    # Floor at 0
     assert _approx_pin_score(5900.0, 5800.0) == 0.0
 
 
@@ -296,3 +348,31 @@ def test_approx_pin_score_handles_none():
 
 def test_approx_pin_score_zero_spot():
     assert _approx_pin_score(0.0, 5800.0) is None
+
+
+# ------------------------------------------------------- known-good auth flow
+
+
+@pytest.mark.asyncio
+async def test_flashalpha_uses_secret_when_no_explicit_key(monkeypatch):
+    captured: dict[str, str] = {}
+
+    class _StubFA:
+        def __init__(self, api_key):
+            captured["api_key"] = api_key
+
+        def zero_dte(self, symbol):
+            return {"underlying_price": 5800.0, "regime": {"label": "positive_gamma"}}
+
+        def exposure_levels(self, symbol):
+            return {"levels": {}}
+
+    fake_mod = types.ModuleType("flashalpha")
+    fake_mod.FlashAlpha = _StubFA
+    monkeypatch.setitem(sys.modules, "flashalpha", fake_mod)
+    monkeypatch.setattr(fa, "flashalpha_api_key", lambda: "from-secret-store")
+
+    async with FlashAlphaClient() as c:
+        await c.get_signals()
+
+    assert captured["api_key"] == "from-secret-store"

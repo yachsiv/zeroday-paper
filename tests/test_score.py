@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from zeroday_paper.config import settings
 from zeroday_paper.engine.models import PatternHit, StrategyType
 from zeroday_paper.engine.score import regime_ok, score_state
 
@@ -165,3 +166,48 @@ def test_score_state_iron_condor_no_wall_bonus(make_state, make_signals):
     res = score_state(state, StrategyType.IRON_CONDOR)
     assert all("near_put_wall_for_bull_put" not in n for n in res.notes)
     assert all("near_call_wall_for_bear_call" not in n for n in res.notes)
+
+
+# ------------------------------------------------------------- threshold regression
+
+
+def test_score_threshold_is_13_for_paper_warmup_window():
+    """Regression: paper.toml `score_threshold` was lowered 15 → 13 on
+    2026-05-26 to start writing paper trades faster while FlashAlpha + Anthropic
+    fixes bake in. This test fails if it's accidentally raised back before we
+    have ≥30 trades to evaluate quality."""
+    assert settings.engine.score_threshold == 13, (
+        "score_threshold must remain 13 for the first 5 paper trading days. "
+        "See TODO in config/paper.toml before raising."
+    )
+
+
+def test_bull_put_clears_threshold_13_with_positive_gamma(make_state, make_signals):
+    """A vanilla positive-gamma state (no FlashAlpha-only bonuses, no VIX-calm
+    bonus, no L1/L2 pattern hits) must clear `score_threshold = 13`.
+
+    Without this guarantee the scanner can't write a paper trade — which is
+    exactly what happened all day 2026-05-26 when FlashAlpha was DNS-broken
+    and Anthropic was 404'ing.
+
+    Math: base 10 + positive_gamma 4 = 14 ≥ 13.
+    """
+    state = make_state(
+        asof=_et_utc(11, 0),
+        signals=make_signals(
+            gamma_regime="positive_gamma",
+            # Explicitly null-out the levels FlashAlpha provides so we prove the
+            # baseline (no GEX-proximity bonuses) still clears the lowered bar.
+            gamma_flip=None,
+            call_wall=None,
+            put_wall=None,
+            magnet_strike=None,
+            pin_score=None,
+        ),
+    )
+    res = score_state(state, StrategyType.BULL_PUT)
+    assert res.regime_ok is True
+    assert res.total >= settings.engine.score_threshold, (
+        f"BULL_PUT score {res.total} did not clear threshold "
+        f"{settings.engine.score_threshold}; breakdown={res.breakdown}"
+    )
