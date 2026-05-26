@@ -52,6 +52,7 @@ ZERODAY_SECRET_IDS = [
     "zeroday/flashalpha",
     "zeroday/anthropic",
     "zeroday/discord",
+    "zeroday/perplexity",
 ]
 
 
@@ -276,6 +277,25 @@ class ZerodayPaperStack(Stack):
             container_overrides=[targets.ContainerOverride(
                 container_name="app",
                 environment=[targets.TaskEnvironmentVariable(name="MODE", value="report")],
+            )],
+        ))
+
+        # 08:00 ET Mon-Fri → morning brief (12:00 UTC during EDT).
+        morning_rule = events.Rule(
+            self, "MorningRule",
+            description="Build + post pre-market brief at 08:00 ET (EDT cron)",
+            schedule=events.Schedule.cron(minute="0", hour="12", week_day="MON-FRI"),
+        )
+        morning_rule.add_target(targets.EcsTask(
+            cluster=cluster,
+            task_definition=task_def,
+            task_count=1,
+            subnet_selection=subnets,
+            security_groups=[task_sg],
+            assign_public_ip=False,
+            container_overrides=[targets.ContainerOverride(
+                container_name="app",
+                environment=[targets.TaskEnvironmentVariable(name="MODE", value="morning")],
             )],
         ))
 
