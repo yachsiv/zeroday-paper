@@ -89,6 +89,11 @@ async def run_one_cycle(journal: Journal) -> dict[str, int]:
             logger.warning("cycle.flashalpha_failed", error=str(exc))
             signals = signals_from_chain(chain)
 
+        if chain.spot <= 0:
+            logger.warning("cycle.spot_unresolved", calls=len(chain.calls), puts=len(chain.puts))
+            stats["errors"] += 1
+            return stats
+
         state = MarketState(asof=now, chain=chain, signals=signals, vols=vols, spot=chain.spot)
 
         # ----- Monitor open positions ---------------------------------------

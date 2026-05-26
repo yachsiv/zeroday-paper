@@ -36,8 +36,10 @@ logs/*.log
 
 # AWS / CDK
 cdk.out/
+cdk-outputs.json
 .cdk.staging/
 node_modules/
+.cache/
 
 # Editor
 .vscode/
