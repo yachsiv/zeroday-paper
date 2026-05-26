@@ -114,10 +114,12 @@ class ZerodayPaperStack(Stack):
 
         # ----- ECR + image --------------------------------------------------
         # Build the Docker image from the repo root and push to a fresh ECR repo.
+        import os
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         image_asset = ecr_assets.DockerImageAsset(
             self, "AppImage",
-            directory="..",
-            platform=ecr_assets.Platform.LINUX_AMD64,
+            directory=repo_root,
+            platform=ecr_assets.Platform.LINUX_ARM64,
         )
 
         # ----- ECS cluster --------------------------------------------------
@@ -168,6 +170,10 @@ class ZerodayPaperStack(Stack):
             task_role=task_role,
             execution_role=exec_role,
             family="zeroday-paper",
+            runtime_platform=ecs.RuntimePlatform(
+                cpu_architecture=ecs.CpuArchitecture.ARM64,
+                operating_system_family=ecs.OperatingSystemFamily.LINUX,
+            ),
         )
 
         task_def.add_volume(
@@ -287,9 +293,10 @@ class ZerodayPaperStack(Stack):
         )
 
         # ----- Outputs ------------------------------------------------------
-        CfnOutput(self, "ClusterName", value=cluster.cluster_name)
-        CfnOutput(self, "TaskDefArn", value=task_def.task_definition_arn)
-        CfnOutput(self, "BackupBucket", value=backup_bucket.bucket_name)
-        CfnOutput(self, "EfsId", value=file_system.file_system_id)
-        CfnOutput(self, "ImageUri", value=image_asset.image_uri)
-        CfnOutput(self, "LogGroup", value=log_group.log_group_name)
+        CfnOutput(self, "OutClusterName", value=cluster.cluster_name)
+        CfnOutput(self, "OutTaskDefArn", value=task_def.task_definition_arn)
+        CfnOutput(self, "OutBackupBucket", value=backup_bucket.bucket_name)
+        CfnOutput(self, "OutEfsId", value=file_system.file_system_id)
+        CfnOutput(self, "OutImageUri", value=image_asset.image_uri)
+        CfnOutput(self, "OutLogGroup", value=log_group.log_group_name)
+        CfnOutput(self, "OutTaskSgId", value=task_sg.security_group_id)
