@@ -134,33 +134,105 @@ class PolygonClient:
         raise PolygonTransportError(f"unreachable for {path}")  # pragma: no cover
 
     async def get_spx_spot(self) -> float:
-        """Current SPX index spot price."""
-        data = await self._get(f"/v3/snapshot/indices", params={"ticker.any_of": SPX_TICKER})
-        results = data.get("results") or []
-        if not results:
-            raise PolygonError("no SPX snapshot result")
-        value = results[0].get("value")
-        if value is None:
-            session = results[0].get("session") or {}
-            value = session.get("price") or session.get("close")
-        if value is None:
-            raise PolygonError(f"SPX spot missing in snapshot: {results[0]}")
-        return float(value)
+        """Current SPX index spot price.
+
+        Tries (in order) the indices snapshot (needs Indices plan), then falls
+        back to extracting `underlying_asset.value` from a 1-contract option chain
+        peek, then to SPY * 10 as a last resort. This keeps the Options-Advanced-
+        only user from hitting a hard 403 path.
+        """
+        try:
+            data = await self._get("/v3/snapshot/indices", params={"ticker.any_of": SPX_TICKER})
+            results = data.get("results") or []
+            if results:
+                value = results[0].get("value")
+                if value is None:
+                    session = results[0].get("session") or {}
+                    value = session.get("price") or session.get("close")
+                if value is not None:
+                    return float(value)
+        except PolygonAuthError:
+            pass
+        except Exception as e:
+            logger.debug("polygon.indices_snapshot_failed", error=str(e))
+
+        try:
+            data = await self._get(
+                f"/v3/snapshot/options/{SPX_OPT_ROOT}",
+                params={"limit": 1},
+            )
+            results = data.get("results") or []
+            if results:
+                ua = results[0].get("underlying_asset") or {}
+                v = ua.get("price") or ua.get("value")
+                if v is not None:
+                    return float(v)
+        except Exception as e:
+            logger.debug("polygon.chain_peek_failed", error=str(e))
+
+        try:
+            data = await self._get(
+                "/v3/snapshot/stocks",
+                params={"ticker.any_of": "SPY"},
+            )
+            results = data.get("results") or []
+            if results:
+                v = results[0].get("value")
+                if v is None:
+                    session = results[0].get("session") or {}
+                    v = session.get("price") or session.get("close")
+                if v is not None:
+                    return float(v) * 10.0
+        except Exception:
+            pass
+
+        try:
+            data = await self._get(
+                "/v3/snapshot",
+                params={"ticker.any_of": "SPY"},
+            )
+            results = data.get("results") or []
+            if results:
+                v = results[0].get("value")
+                if v is None:
+                    session = results[0].get("session") or {}
+                    v = session.get("price") or session.get("close")
+                if v is not None:
+                    return float(v) * 10.0
+        except Exception:
+            pass
+
+        raise PolygonError("could not resolve SPX spot via any endpoint")
 
     async def get_spx_spot_at(self, ts: datetime) -> float:
-        """SPX spot as-of `ts` (replay-safe).
+        """SPX spot as-of `ts`.
 
-        Uses the daily aggregate close for the date. For intraday precision use
-        get_minute_bar.
+        Tries SPX daily aggregate first; falls back to SPY*10 if blocked by plan.
         """
         d = ts.date()
-        data = await self._get(
-            f"/v2/aggs/ticker/{SPX_TICKER}/range/1/day/{d.isoformat()}/{d.isoformat()}",
-        )
-        results = data.get("results") or []
-        if not results:
-            raise PolygonError(f"no SPX daily for {d}")
-        return float(results[0]["c"])
+        try:
+            data = await self._get(
+                f"/v2/aggs/ticker/{SPX_TICKER}/range/1/day/{d.isoformat()}/{d.isoformat()}",
+            )
+            results = data.get("results") or []
+            if results:
+                return float(results[0]["c"])
+        except PolygonAuthError:
+            pass
+        except Exception as e:
+            logger.debug("polygon.spx_daily_failed", error=str(e))
+
+        try:
+            data = await self._get(
+                f"/v2/aggs/ticker/SPY/range/1/day/{d.isoformat()}/{d.isoformat()}",
+            )
+            results = data.get("results") or []
+            if results:
+                return float(results[0]["c"]) * 10.0
+        except Exception:
+            pass
+
+        raise PolygonError(f"no SPX/SPY daily for {d}")
 
     async def get_minute_bar(self, ticker: str, ts: datetime) -> dict[str, float] | None:
         """One-minute bar for `ticker` at the minute containing `ts`."""
@@ -187,10 +259,11 @@ class PolygonClient:
         """Full 0DTE chain snapshot for `expiry`.
 
         Walks the paginated `/v3/snapshot/options/{underlying}` endpoint, filters
-        to the requested expiry, and returns calls + puts.
+        to the requested expiry, and returns calls + puts. If `spot_override` is
+        not provided, spot is derived from put-call parity at the most liquid
+        ATM-ish strike (works on Options-Advanced-only plans where Indices is
+        not entitled).
         """
-        spot = spot_override if spot_override is not None else await self.get_spx_spot()
-
         all_quotes: list[OptionQuote] = []
         next_url: str | None = f"/v3/snapshot/options/{SPX_OPT_ROOT}"
         params: dict[str, Any] | None = {
@@ -214,6 +287,11 @@ class PolygonClient:
         puts = [q for q in all_quotes if q.right == "P"]
         calls.sort(key=lambda q: q.strike)
         puts.sort(key=lambda q: q.strike)
+
+        if spot_override is not None:
+            spot = spot_override
+        else:
+            spot = _derive_spot_from_chain(calls, puts) or 0.0
 
         return ChainSnapshot(
             fetched_at=datetime.now(UTC),
@@ -282,10 +360,9 @@ class PolygonClient:
         Trade-off: bar close is not a true quote. For paper-trading P&L it is
         a reasonable proxy when paired with bid/ask realism in the live path.
         """
-        spot = await self.get_spx_spot_at(ts)
-
-        chain_now = await self.get_chain_snapshot(expiry, spot_override=spot)
+        chain_now = await self.get_chain_snapshot(expiry)
         contracts = chain_now.calls + chain_now.puts
+        spot = chain_now.spot
 
         async def fetch_for(q: OptionQuote) -> OptionQuote:
             bar = await self.get_minute_bar(q.contract, ts)
@@ -312,9 +389,12 @@ class PolygonClient:
         calls = sorted([q for q in priced if q.right == "C"], key=lambda q: q.strike)
         puts = sorted([q for q in priced if q.right == "P"], key=lambda q: q.strike)
 
+        derived = _derive_spot_from_chain(calls, puts)
+        final_spot = derived if derived is not None and derived > 0 else spot
+
         return ChainSnapshot(
             fetched_at=ts.astimezone(UTC),
-            spot=spot,
+            spot=final_spot,
             expiry=expiry,
             calls=calls,
             puts=puts,
@@ -328,6 +408,53 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _derive_spot_from_chain(
+    calls: list[OptionQuote],
+    puts: list[OptionQuote],
+) -> float | None:
+    """Derive SPX spot from put-call parity at the most liquid strike.
+
+    For 0DTE: t→0, r→0, so  C - P ≈ S - K, and S ≈ K + C - P.
+
+    We pick the strike that has both a call and a put with positive bids,
+    smallest bid-ask spread, and highest combined volume. This rejects junk
+    strikes that would yield wildly wrong spot estimates.
+
+    Returns None if no acceptable strike pair exists.
+    """
+    calls_by_strike = {q.strike: q for q in calls if q.mid > 0}
+    puts_by_strike = {q.strike: q for q in puts if q.mid > 0}
+    common = set(calls_by_strike) & set(puts_by_strike)
+    if not common:
+        return None
+
+    def quality(k: float) -> float:
+        c = calls_by_strike[k]
+        p = puts_by_strike[k]
+        spread = max(c.bid_ask_spread, p.bid_ask_spread)
+        liquidity = c.open_interest + p.open_interest + c.volume + p.volume
+        return liquidity / (1.0 + spread)
+
+    best_k = max(common, key=quality)
+    c = calls_by_strike[best_k]
+    p = puts_by_strike[best_k]
+    spot_est = best_k + (c.mid - p.mid)
+
+    candidates = []
+    for k in sorted(common, key=quality, reverse=True)[:10]:
+        cc = calls_by_strike[k]
+        pp = puts_by_strike[k]
+        est = k + (cc.mid - pp.mid)
+        if est > 0:
+            candidates.append(est)
+
+    if not candidates:
+        return None
+    candidates.sort()
+    mid = len(candidates) // 2
+    return candidates[mid] if len(candidates) % 2 == 1 else (candidates[mid - 1] + candidates[mid]) / 2.0
 
 
 def next_spx_expiry(reference: date | None = None) -> date:

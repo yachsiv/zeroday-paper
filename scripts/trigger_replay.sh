@@ -35,5 +35,5 @@ aws ecs run-task \
   --launch-type FARGATE \
   --task-definition "$TASK_DEF_ARN" \
   --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_A,$SUBNET_B],securityGroups=[$TASK_SG],assignPublicIp=DISABLED}" \
-  --overrides "{\"containerOverrides\":[{\"name\":\"app\",\"environment\":[{\"name\":\"MODE\",\"value\":\"replay\"},{\"name\":\"ZP_REPLAY_DAYS\",\"value\":\"$DAYS\"}],\"command\":[\"zp-replay\",\"--days\",\"$DAYS\"]}]}" \
+  --overrides "{\"containerOverrides\":[{\"name\":\"app\",\"environment\":[{\"name\":\"MODE\",\"value\":\"replay\"}],\"command\":[\"--days\",\"$DAYS\"]}]}" \
   --query 'tasks[0].taskArn' --output text

@@ -24,7 +24,33 @@ else:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "paper.toml"
+
+
+def _resolve_default_config_path() -> Path:
+    """Locate config/paper.toml across packaged + dev + container layouts.
+
+    Search order:
+      1. $ZP_CONFIG_PATH
+      2. /app/config/paper.toml (Docker WORKDIR)
+      3. CWD / config / paper.toml
+      4. PROJECT_ROOT / config / paper.toml (works in `uv run` dev mode)
+    """
+    env_override = os.getenv("ZP_CONFIG_PATH")
+    if env_override:
+        return Path(env_override)
+
+    candidates = [
+        Path("/app/config/paper.toml"),
+        Path.cwd() / "config" / "paper.toml",
+        PROJECT_ROOT / "config" / "paper.toml",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
+
+
+DEFAULT_CONFIG_PATH = _resolve_default_config_path()
 
 
 def _parse_hhmm(value: str) -> time:
