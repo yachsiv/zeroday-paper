@@ -82,6 +82,15 @@ def anthropic_api_key() -> str:
     return data.get("api_key") or data.get("ANTHROPIC_API_KEY") or data["value"]
 
 
+def perplexity_api_key() -> str:
+    """Perplexity Sonar API key (used by the morning brief)."""
+    local = os.getenv("PERPLEXITY_API_KEY")
+    if local:
+        return local
+    data = _fetch_secret(settings.secrets.perplexity_secret_id)
+    return data.get("api_key") or data.get("PERPLEXITY_API_KEY") or data["value"]
+
+
 def discord_webhook(key: str | None = None) -> str:
     """Discord webhook URL by key name (defaults to reporting.discord_webhook_secret_key).
 

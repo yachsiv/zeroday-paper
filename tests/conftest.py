@@ -12,6 +12,7 @@ import os
 os.environ.setdefault("POLYGON_API_KEY", "test-polygon-key")
 os.environ.setdefault("FLASHALPHA_API_KEY", "test-flashalpha-key")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
+os.environ.setdefault("PERPLEXITY_API_KEY", "test-perplexity-key")
 os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://discord.test/webhook")
 # Prevent any boto3/Secrets-Manager fallthrough during tests.
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "test-fake")
