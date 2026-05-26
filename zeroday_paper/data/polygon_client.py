@@ -234,6 +234,66 @@ class PolygonClient:
 
         raise PolygonError(f"no SPX/SPY daily for {d}")
 
+    async def get_prev_day_aggregate(self, ticker: str) -> dict[str, float] | None:
+        """Previous trading-day OHLCV for `ticker` via /v2/aggs/.../prev.
+
+        Returns None if Polygon returns no results (empty plan, off-day). Auth
+        / transport errors are raised so the caller can mark the section
+        ``[UNAVAILABLE]``.
+        """
+        try:
+            data = await self._get(f"/v2/aggs/ticker/{ticker}/prev")
+        except PolygonAuthError:
+            raise
+        except Exception as exc:
+            logger.debug("polygon.prev_day_failed", ticker=ticker, error=str(exc))
+            return None
+        results = data.get("results") or []
+        if not results:
+            return None
+        bar = results[0]
+        return {
+            "open": float(bar.get("o", 0.0)),
+            "high": float(bar.get("h", 0.0)),
+            "low": float(bar.get("l", 0.0)),
+            "close": float(bar.get("c", 0.0)),
+            "volume": float(bar.get("v", 0.0)),
+            "timestamp": float(bar.get("t", 0.0)),
+        }
+
+    async def get_minute_bars_range(
+        self,
+        ticker: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, float]]:
+        """Minute-resolution bars for `ticker` over [start, end].
+
+        Used to read SPY's overnight (post-close → pre-open) bars when the
+        ES futures feed isn't entitled. Returns an empty list on no-results.
+        """
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        from_ms = int(start.timestamp() * 1000)
+        to_ms = int(end.timestamp() * 1000)
+        data = await self._get(
+            f"/v2/aggs/ticker/{ticker}/range/1/minute/{from_ms}/{to_ms}",
+            params={"adjusted": "true", "sort": "asc", "limit": 5000},
+        )
+        out: list[dict[str, float]] = []
+        for bar in data.get("results") or []:
+            out.append({
+                "open": float(bar.get("o", 0.0)),
+                "high": float(bar.get("h", 0.0)),
+                "low": float(bar.get("l", 0.0)),
+                "close": float(bar.get("c", 0.0)),
+                "volume": float(bar.get("v", 0.0)),
+                "timestamp": float(bar.get("t", 0.0)),
+            })
+        return out
+
     async def get_minute_bar(self, ticker: str, ts: datetime) -> dict[str, float] | None:
         """One-minute bar for `ticker` at the minute containing `ts`."""
         if ts.tzinfo is None:

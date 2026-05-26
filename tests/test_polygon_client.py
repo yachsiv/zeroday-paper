@@ -306,6 +306,78 @@ async def test_polygon_get_spx_spot_at_daily_close(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_polygon_get_prev_day_aggregate_success(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/v2/aggs/ticker/SPY/prev" in str(req.url)
+        return httpx.Response(200, json={"results": [
+            {"o": 578.0, "h": 581.0, "l": 577.0, "c": 580.0, "v": 1e8, "t": 0}
+        ]})
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        out = await c.get_prev_day_aggregate("SPY")
+        assert out is not None
+        assert out["close"] == pytest.approx(580.0)
+        assert out["volume"] == pytest.approx(1e8)
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_prev_day_aggregate_empty(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        assert await c.get_prev_day_aggregate("SPY") is None
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_prev_day_aggregate_auth_propagates(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "no entitle"})
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        with pytest.raises(PolygonAuthError):
+            await c.get_prev_day_aggregate("SPY")
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_minute_bars_range_parses(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "/v2/aggs/ticker/SPY/range/1/minute/" in str(req.url)
+        return httpx.Response(200, json={"results": [
+            {"o": 580.0, "h": 581.0, "l": 579.5, "c": 580.5, "v": 1e5, "t": 1},
+            {"o": 580.5, "h": 583.0, "l": 580.0, "c": 582.0, "v": 1e5, "t": 2},
+        ]})
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        bars = await c.get_minute_bars_range(
+            "SPY",
+            datetime(2026, 5, 26, 22, 0, tzinfo=UTC),
+            datetime(2026, 5, 27, 12, 0, tzinfo=UTC),
+        )
+        assert len(bars) == 2
+        assert bars[1]["close"] == pytest.approx(582.0)
+
+
+@pytest.mark.asyncio
+async def test_polygon_get_minute_bars_range_naive_ts_treated_as_utc(monkeypatch):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        out = await c.get_minute_bars_range(
+            "SPY",
+            datetime(2026, 5, 26, 22, 0),
+            datetime(2026, 5, 27, 12, 0),
+        )
+        assert out == []
+
+
+@pytest.mark.asyncio
 async def test_polygon_get_spx_spot_at_no_results_raises(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"results": []})
