@@ -45,6 +45,7 @@ from zeroday_paper.engine.pricing import entry_quote, exit_quote
 from zeroday_paper.engine.score import score_state
 from zeroday_paper.engine.state import decide_exit
 from zeroday_paper.engine.strike_select import select_for
+from zeroday_paper.metrics import emit as emit_metric
 
 logger = structlog.get_logger(__name__)
 ET = ZoneInfo(settings.engine.market_timezone)
@@ -106,6 +107,13 @@ async def run_one_cycle(journal: Journal) -> dict[str, int]:
         stats["new_trades"] = scanned
 
     journal.heartbeat("scanner")
+    emit_metric("cycle.complete", 1.0)
+    if stats["new_trades"]:
+        emit_metric("trade.written", float(stats["new_trades"]))
+    if stats["exited"]:
+        emit_metric("position.exit", float(stats["exited"]))
+    if stats["errors"]:
+        emit_metric("cycle.errors", float(stats["errors"]))
     logger.info("cycle.complete", **stats, spot=state.spot, regime=state.signals.gamma_regime)
     return stats
 
@@ -300,13 +308,37 @@ def is_market_hours_et(now_utc: datetime | None = None) -> bool:
 
 
 async def run_live_loop() -> None:
+    """Live scanner loop.
+
+    Behavior:
+      - Pre-session weekday boot (e.g. cron fires at 09:28 ET): sleep until
+        session_start, then begin scanning. Sleep cap = 30 min so we don't go
+        completely dark even if the clock jumps unexpectedly.
+      - Inside the session: poll every interval_s, run one cycle, repeat.
+      - Past session_end: log and exit (Fargate task naturally stops).
+      - Weekend / holiday: log and exit.
+    """
     journal = Journal()
     interval = settings.engine.poll_interval_seconds
     logger.info("live.start", interval_s=interval, threshold=settings.engine.score_threshold)
     try:
         while True:
-            if not is_market_hours_et():
-                logger.info("live.outside_market_hours_exit")
+            now_et = datetime.now(UTC).astimezone(ET)
+            if now_et.weekday() >= 5:
+                logger.info("live.weekend_exit")
+                return
+            t = now_et.time()
+            if t < settings.engine.session_start:
+                target = datetime.combine(
+                    now_et.date(), settings.engine.session_start, tzinfo=ET
+                )
+                wait_s = max(0.0, (target - now_et).total_seconds())
+                logger.info("live.pre_session_wait", seconds=int(wait_s))
+                journal.heartbeat("scanner", status="waiting_for_session")
+                await asyncio.sleep(min(wait_s + 5, 1800))
+                continue
+            if t > settings.engine.session_end:
+                logger.info("live.after_session_exit")
                 return
             try:
                 await run_one_cycle(journal)

@@ -32,6 +32,7 @@ from aws_cdk import aws_efs as efs
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as targets
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_secretsmanager as secretsmanager
@@ -151,6 +152,11 @@ class ZerodayPaperStack(Stack):
             actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
             resources=secret_arns,
         ))
+        task_role.add_to_policy(iam.PolicyStatement(
+            actions=["cloudwatch:PutMetricData"],
+            resources=["*"],
+            conditions={"StringEquals": {"cloudwatch:namespace": "zeroday/paper"}},
+        ))
         backup_bucket.grant_put(task_role)
         backup_bucket.grant_read_write(task_role)
 
@@ -239,8 +245,8 @@ class ZerodayPaperStack(Stack):
         # Crons are UTC; we lock to EDT until DST rollover (Nov), then add EST rules.
         live_rule = events.Rule(
             self, "LiveStartRule",
-            description="Start paper-live at 09:20 ET (EDT cron)",
-            schedule=events.Schedule.cron(minute="20", hour="13", week_day="MON-FRI"),
+            description="Start paper-live at 09:28 ET (EDT cron; code-side waits until 09:30 session_start)",
+            schedule=events.Schedule.cron(minute="28", hour="13", week_day="MON-FRI"),
         )
         live_rule.add_target(targets.EcsTask(
             cluster=cluster,
@@ -273,24 +279,96 @@ class ZerodayPaperStack(Stack):
             )],
         ))
 
-        # ----- CloudWatch alarm (single, silent-scanner) -------------------
-        # Fires when the live task hasn't logged a cycle.complete in 30 minutes
-        # during market hours. Wires to Discord via webhook later.
+        # ----- CloudWatch alarm + Discord notifier -------------------------
+        # The scanner emits cycle.complete metric on every successful cycle.
+        # If we don't see >=1 in 15 min during market hours, alarm fires.
         scanner_metric = cw.Metric(
             namespace="zeroday/paper",
             metric_name="cycle.complete",
             statistic="Sum",
             period=Duration.minutes(15),
         )
-        cw.Alarm(
+        scanner_alarm = cw.Alarm(
             self, "ScannerSilentAlarm",
             metric=scanner_metric,
+            alarm_name="zeroday-paper-scanner-silent",
             threshold=1,
             evaluation_periods=2,
             comparison_operator=cw.ComparisonOperator.LESS_THAN_THRESHOLD,
-            treat_missing_data=cw.TreatMissingData.BREACHING,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
             alarm_description="Paper scanner silent during market hours",
         )
+
+        alarm_lambda = lambda_.Function(
+            self, "AlarmNotifier",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="index.handler",
+            timeout=Duration.seconds(15),
+            description="Posts ScannerSilentAlarm state changes to Discord webhook_monitor",
+            environment={
+                "DISCORD_SECRET_ID": "zeroday/discord",
+                "DISCORD_KEY": "webhook_monitor",
+            },
+            code=lambda_.Code.from_inline(
+                """
+import json
+import os
+import urllib.request
+import boto3
+
+_client = boto3.client('secretsmanager')
+_webhook_cache = None
+
+
+def _webhook():
+    global _webhook_cache
+    if _webhook_cache:
+        return _webhook_cache
+    secret_id = os.environ['DISCORD_SECRET_ID']
+    key = os.environ['DISCORD_KEY']
+    resp = _client.get_secret_value(SecretId=secret_id)
+    data = json.loads(resp['SecretString'])
+    _webhook_cache = data[key]
+    return _webhook_cache
+
+
+def handler(event, _ctx):
+    detail = event.get('detail', {})
+    alarm_name = detail.get('alarmName') or event.get('alarmName') or 'unknown'
+    state = (detail.get('state') or {}).get('value') or event.get('NewStateValue') or 'UNKNOWN'
+    reason = (detail.get('state') or {}).get('reason') or event.get('NewStateReason') or ''
+    if state == 'ALARM':
+        emoji = '[ALARM]'
+    elif state == 'OK':
+        emoji = '[OK]'
+    else:
+        emoji = '[INFO]'
+    content = f"{emoji} **{alarm_name}** -> {state}\\n{reason[:1500]}"
+    body = json.dumps({'content': content}).encode()
+    req = urllib.request.Request(_webhook(), data=body, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return {'status': r.status}
+"""
+            ),
+        )
+
+        alarm_lambda.role.add_to_principal_policy(iam.PolicyStatement(
+            actions=["secretsmanager:GetSecretValue"],
+            resources=[
+                f"arn:aws:secretsmanager:{self.region}:{self.account}:secret:zeroday/discord-*"
+            ],
+        ))
+
+        alarm_event_rule = events.Rule(
+            self, "AlarmToDiscordRule",
+            description="Forward ScannerSilentAlarm state changes to Discord",
+            event_pattern=events.EventPattern(
+                source=["aws.cloudwatch"],
+                detail_type=["CloudWatch Alarm State Change"],
+                detail={"alarmName": [scanner_alarm.alarm_name]},
+            ),
+        )
+        alarm_event_rule.add_target(targets.LambdaFunction(alarm_lambda))
 
         # ----- Outputs ------------------------------------------------------
         CfnOutput(self, "OutClusterName", value=cluster.cluster_name)
