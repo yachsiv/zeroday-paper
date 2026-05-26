@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Dispatch MODE → CLI command.
 #
-#   MODE=live    → zp-live   (2-min loop, exits at session end)
-#   MODE=replay  → zp-replay (one-shot historical fill)
-#   MODE=report  → zp-report (build + post daily report)
+#   MODE=live     → zp-live    (2-min loop, exits at session end)
+#   MODE=replay   → zp-replay  (one-shot historical fill)
+#   MODE=report   → zp-report  (build + post daily report)
+#   MODE=morning  → zp-morning (build + post pre-market brief)
 #
 # Any extra args are forwarded.
 set -euo pipefail
@@ -20,6 +21,9 @@ case "$MODE" in
     ;;
   report)
     exec zp-report "$@"
+    ;;
+  morning)
+    exec zp-morning "$@"
     ;;
   *)
     echo "[entrypoint] unknown MODE: $MODE" >&2
