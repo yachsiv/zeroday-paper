@@ -68,8 +68,11 @@ def test_regime_ok_blocks_after_session_end(make_state):
 
 
 def test_regime_ok_blocks_after_entry_cutoff(make_state):
-    # session_start=9:30, cutoff=13:30 → 13:45 should block
-    state = make_state(asof=_et_utc(13, 45))
+    # session_start=9:30, cutoff=14:30 → 14:45 should block.
+    # The reason label "after_entry_cutoff_13_30" is a stale code constant in
+    # score.py (kept to avoid touching scoring code); it fires for any
+    # post-cutoff time regardless of the configured value.
+    state = make_state(asof=_et_utc(14, 45))
     ok, reason = regime_ok(state)
     assert ok is False
     assert reason == "after_entry_cutoff_13_30"

@@ -9,7 +9,7 @@ poll_interval_seconds = 120                # 2-min cadence (vs main zeroday 15-m
 score_threshold = 13                        # paper enters when score >= 13 (first 5 days)
 session_start = "09:30"
 session_end = "15:45"
-new_entry_cutoff = "13:30"                  # no new paper entries after 13:30 ET
+new_entry_cutoff = "14:30"                  # no new paper entries after 14:30 ET (extended 2026-05-27 for data collection)
 market_timezone = "America/New_York"
 warmup_minutes_after_open = 5               # observe first 5 min, do not trade
 

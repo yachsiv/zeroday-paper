@@ -75,7 +75,7 @@ def test_iter_scan_times_for_window():
     first = times[0].astimezone(ET)
     last = times[-1].astimezone(ET)
     assert first.time() == time(9, 35)
-    assert last.time() <= time(13, 30)
+    assert last.time() <= time(14, 30)
 
 
 def test_iter_scan_times_for_2min_cadence():
