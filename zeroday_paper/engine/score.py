@@ -83,27 +83,56 @@ def score_state(
     breakdown["regime_alignment"] = regime_bonus
 
     # GEX proximity -------------------------------------------------------
+    # Graded wall bonus (loosened 2026-05-27): SPX walls are routinely 100+ pts
+    # away from spot, so the old hard 25pt threshold almost never fired and
+    # left positive-gamma days under-scored. Award:
+    #     within 25 pt  → +3 (very close, structural support/resistance)
+    #     within 50 pt  → +2
+    #     within 100 pt → +1
+    #     beyond        → +0
     prox = compute_proximity(state)
     prox_bonus = 0
     if prox.above_flip is True:
         prox_bonus += 1
         notes.append("above_gamma_flip:+1")
-    if strategy == StrategyType.BULL_PUT and prox.to_put_wall is not None and prox.to_put_wall < 25:
-        prox_bonus += 2
-        notes.append("near_put_wall_for_bull_put:+2")
-    if strategy == StrategyType.BEAR_CALL and prox.to_call_wall is not None and prox.to_call_wall < 25 and prox.to_call_wall > -10:
-        prox_bonus += 2
-        notes.append("near_call_wall_for_bear_call:+2")
+    if strategy == StrategyType.BULL_PUT and prox.to_put_wall is not None:
+        d = prox.to_put_wall  # spot - put_wall; positive when spot above wall (normal setup)
+        if 0 <= d < 25:
+            prox_bonus += 3
+            notes.append(f"near_put_wall_for_bull_put_{d}pt:+3")
+        elif 0 <= d < 50:
+            prox_bonus += 2
+            notes.append(f"near_put_wall_for_bull_put_{d}pt:+2")
+        elif 0 <= d < 100:
+            prox_bonus += 1
+            notes.append(f"near_put_wall_for_bull_put_{d}pt:+1")
+    if strategy == StrategyType.BEAR_CALL and prox.to_call_wall is not None:
+        # spot - call_wall; for bear_call we want spot BELOW the wall, so d<=0.
+        d = -prox.to_call_wall
+        if -10 <= prox.to_call_wall < 0 and d < 25:
+            prox_bonus += 3
+            notes.append(f"near_call_wall_for_bear_call_{prox.to_call_wall}pt:+3")
+        elif 0 <= d < 50:
+            prox_bonus += 2
+            notes.append(f"near_call_wall_for_bear_call_{prox.to_call_wall}pt:+2")
+        elif 0 <= d < 100:
+            prox_bonus += 1
+            notes.append(f"near_call_wall_for_bear_call_{prox.to_call_wall}pt:+1")
     if state.signals.pin_score is not None and state.signals.pin_score >= 70:
         prox_bonus += 2
         notes.append(f"pin_score_{state.signals.pin_score}:+2")
     breakdown["gex_proximity"] = prox_bonus
 
     # Volatility ----------------------------------------------------------
+    # Loosened 2026-05-27: vix_1d < 14 is rare; reward <18 as well (lighter).
     vol_bonus = 0
-    if state.vols.vix_1d is not None and state.vols.vix_1d < 14:
-        vol_bonus += 2
-        notes.append("vix1d_calm:+2")
+    if state.vols.vix_1d is not None:
+        if state.vols.vix_1d < 14:
+            vol_bonus += 2
+            notes.append(f"vix1d_calm_{state.vols.vix_1d}_lt_14:+2")
+        elif state.vols.vix_1d < 18:
+            vol_bonus += 1
+            notes.append(f"vix1d_calm_{state.vols.vix_1d}_lt_18:+1")
     rr25 = compute_rr25(state)
     if rr25 is not None and rr25 < 5:
         vol_bonus += 1

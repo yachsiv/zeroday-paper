@@ -53,7 +53,11 @@ rate_limit_polygon_req_per_min = 60         # well under 300/min hard limit
 
 [patterns]
 layer_2_llm_enabled = true                  # Anthropic Claude classifier
-layer_2_min_confidence = 0.65               # only accept LLM patterns above this
+# Lowered 2026-05-27 (0.65 → 0.55) so the LLM actually surfaces patterns on
+# real cycles. Coupled with the +1 score bonus now firing at conf>=0.65
+# (was 0.75) in gex_patterns_llm.py — both knobs lowered together to start
+# collecting paper trades during the warmup window.
+layer_2_min_confidence = 0.55
 layer_2_max_calls_per_scan = 3              # cost cap per scan cycle
 # Resolved 2026-05-26 by live probe against Anthropic Messages API.
 # `claude-3-5-sonnet-20241022` started returning 404 not_found_error in May 2026

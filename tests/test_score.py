@@ -211,3 +211,88 @@ def test_bull_put_clears_threshold_13_with_positive_gamma(make_state, make_signa
         f"BULL_PUT score {res.total} did not clear threshold "
         f"{settings.engine.score_threshold}; breakdown={res.breakdown}"
     )
+
+
+def test_bull_put_clears_threshold_13_with_live_walls_far_from_spot(
+    make_state, make_signals, make_vols,
+):
+    """Reproduces the 2026-05-27 live regime: walls are >100pt away from spot
+    so the old hard <25pt wall bonus never fires; VIX1D=17 so the old <14
+    bonus never fires either. Score must still clear threshold via the new
+    graded proximity bonus + pin_score + base/regime baseline.
+
+    Realistic numbers: spot=7519, put_wall=7395 (124pt below), call_wall=8200
+    (681pt above), pin_score=85, vix_1d=17 — i.e. exactly today.
+    """
+    state = make_state(
+        spot=7519.0,
+        asof=_et_utc(11, 0),
+        signals=make_signals(
+            spot=7519.0,
+            gamma_regime="positive_gamma",
+            gamma_flip=7400.0,    # above-flip bonus +1
+            call_wall=8200.0,     # 681pt above → 0pt bonus from call wall
+            put_wall=7395.0,      # 124pt below → +0 (>100pt) ... regression
+            magnet_strike=7520.0,
+            pin_score=85.0,       # ≥70 → +2
+            total_gex=3.5,
+        ),
+        vols=make_vols(vix_1d=17.0, cboe_skew=137.0),  # vix in [14,18] → +1
+    )
+    res = score_state(state, StrategyType.BULL_PUT)
+    assert res.regime_ok is True
+    # base 10 + regime 4 + above_flip 1 + pin 2 + vix1d_lt_18 1 = 18 ≥ 13
+    assert res.total >= settings.engine.score_threshold, (
+        f"realistic BULL_PUT score {res.total} did not clear threshold "
+        f"{settings.engine.score_threshold}; breakdown={res.breakdown}; notes={res.notes}"
+    )
+    # Score should not double-count walls when they are >100pt away.
+    assert all("near_put_wall" not in n for n in res.notes)
+
+
+def test_proximity_bonus_grades_by_distance(make_state, make_signals):
+    """Within 25pt → +3; within 50 → +2; within 100 → +1; beyond → +0."""
+    # 10pt to put_wall → +3 (within 25)
+    state_close = make_state(spot=5760.0, signals=make_signals(spot=5760.0, put_wall=5750.0))
+    res_close = score_state(state_close, StrategyType.BULL_PUT)
+    assert any("near_put_wall_for_bull_put" in n and ":+3" in n for n in res_close.notes), (
+        f"expected +3 bonus at 10pt distance, got notes={res_close.notes}"
+    )
+
+    # 40pt → +2 (within 50)
+    state_mid = make_state(spot=5790.0, signals=make_signals(spot=5790.0, put_wall=5750.0))
+    res_mid = score_state(state_mid, StrategyType.BULL_PUT)
+    assert any("near_put_wall_for_bull_put" in n and ":+2" in n for n in res_mid.notes), (
+        f"expected +2 bonus at 40pt distance, got notes={res_mid.notes}"
+    )
+
+    # 80pt → +1 (within 100)
+    state_far = make_state(spot=5830.0, signals=make_signals(spot=5830.0, put_wall=5750.0))
+    res_far = score_state(state_far, StrategyType.BULL_PUT)
+    assert any("near_put_wall_for_bull_put" in n and ":+1" in n for n in res_far.notes), (
+        f"expected +1 bonus at 80pt distance, got notes={res_far.notes}"
+    )
+
+    # 150pt → +0 (beyond 100)
+    state_beyond = make_state(spot=5900.0, signals=make_signals(spot=5900.0, put_wall=5750.0))
+    res_beyond = score_state(state_beyond, StrategyType.BULL_PUT)
+    assert all("near_put_wall_for_bull_put" not in n for n in res_beyond.notes)
+
+
+def test_vix_bonus_grades_below_18_and_below_14(make_state, make_vols):
+    # vix=15 should yield +1 (lt_18 band)
+    state = make_state(asof=_et_utc(11, 0), vols=make_vols(vix_1d=15.0))
+    res = score_state(state, StrategyType.BULL_PUT)
+    assert any("vix1d_calm_15.0_lt_18" in n for n in res.notes), res.notes
+    assert ":+1" in next(n for n in res.notes if "vix1d_calm" in n)
+
+    # vix=10 should yield +2 (lt_14 band)
+    state_calm = make_state(asof=_et_utc(11, 0), vols=make_vols(vix_1d=10.0))
+    res_calm = score_state(state_calm, StrategyType.BULL_PUT)
+    assert any("vix1d_calm_10.0_lt_14" in n for n in res_calm.notes), res_calm.notes
+    assert ":+2" in next(n for n in res_calm.notes if "vix1d_calm" in n)
+
+    # vix=22 should yield no bonus (and not block regime since gate=25)
+    state_high = make_state(asof=_et_utc(11, 0), vols=make_vols(vix_1d=22.0))
+    res_high = score_state(state_high, StrategyType.BULL_PUT)
+    assert all("vix1d_calm" not in n for n in res_high.notes)

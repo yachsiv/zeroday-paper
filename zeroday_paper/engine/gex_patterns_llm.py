@@ -156,7 +156,10 @@ async def classify_layer2(
                 matched=True,
                 confidence=_bucket_confidence(conf),
                 direction=str(m.get("direction", "NEUTRAL")).upper(),
-                score_bonus=1 if conf >= 0.75 else 0,
+                # Lowered 2026-05-27 from 0.75 → 0.65 to actually award the bonus
+                # on real Anthropic responses (which rarely emit ≥0.75 for SPX
+                # 0DTE pattern matches given the inherent ambiguity).
+                score_bonus=1 if conf >= 0.65 else 0,
                 description=str(m.get("rationale", "")),
             ))
         except (KeyError, ValueError, TypeError):

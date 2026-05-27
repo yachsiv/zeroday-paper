@@ -575,6 +575,262 @@ async def test_run_live_loop_in_session_runs_cycle_then_after_session_exits(monk
     assert fake_j.closed is True
 
 
+# ------------------------------------------------ scan observability (Phase A)
+
+
+@pytest.mark.asyncio
+async def test_scan_for_entries_emits_scan_score_log_per_strategy(
+    tmp_path, make_state, monkeypatch,
+):
+    """Every strategy scan must emit a scan.score event with the full breakdown
+    so we never fly blind on why no trade was written."""
+    j = Journal(str(tmp_path / "s.duckdb"))
+    state = make_state(asof=_et_utc(11, 0))
+
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    events: list[tuple[str, dict]] = []
+    real_info = sc.logger.info
+
+    def _spy(event, *args, **kw):
+        events.append((event, kw))
+        return real_info(event, *args, **kw)
+
+    monkeypatch.setattr(sc.logger, "info", _spy)
+
+    await sc._scan_for_entries(j, state)
+
+    scan_score_events = [e for e in events if e[0] == "scan.score"]
+    assert len(scan_score_events) == 2, "expected scan.score for both strategies"
+    strategies = {e[1]["strategy"] for e in scan_score_events}
+    assert "BULL_PUT_SPREAD" in strategies
+    assert "BEAR_CALL_SPREAD" in strategies
+    sample = scan_score_events[0][1]
+    for required in (
+        "total", "breakdown", "regime_ok", "notes", "threshold",
+        "signals_source", "spot", "to_put_wall", "to_call_wall",
+        "above_flip", "pin_score", "vix_1d",
+    ):
+        assert required in sample, f"scan.score missing field {required}"
+    j.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_for_entries_emits_below_threshold_when_score_low(
+    tmp_path, make_state, make_signals, monkeypatch,
+):
+    """When score < threshold we must log scan.below_threshold so the operator
+    knows the cycle was suppressed by scoring rather than something else."""
+    j = Journal(str(tmp_path / "s.duckdb"))
+    # Force regime block → score=0 < 13 → below_threshold expected.
+    state = make_state(asof=_et_utc(11, 0),
+                       signals=make_signals(gamma_regime="negative_gamma"))
+
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    events: list[str] = []
+    real_info = sc.logger.info
+
+    def _spy(event, *args, **kw):
+        events.append(event)
+        return real_info(event, *args, **kw)
+
+    monkeypatch.setattr(sc.logger, "info", _spy)
+
+    await sc._scan_for_entries(j, state)
+    assert "scan.below_threshold" in events
+    j.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_for_entries_emits_no_spread_when_selector_fails(
+    tmp_path, make_state, make_chain, make_signals, monkeypatch,
+):
+    """If select_for cannot produce a spread we must log scan.no_spread with
+    the reasons + candidates_considered so the operator can see WHY."""
+    j = Journal(str(tmp_path / "s.duckdb"))
+
+    # Build a chain whose puts are very far OTM → no_short_in_delta_band and
+    # also outside moneyness band so we genuinely return spread=None.
+    chain = make_chain(spot=5800.0, n_strikes=5, step=50)  # very wide spacing
+    state = make_state(
+        spot=5800.0,
+        asof=_et_utc(11, 0),
+        chain=chain,
+        signals=make_signals(spot=5800.0),
+    )
+    # Force selector to return None directly.
+    from zeroday_paper.engine.strike_select import SelectionResult
+    monkeypatch.setattr(sc, "select_for", lambda strat, st: SelectionResult(
+        spread=None, reasons=["test_forced_none"], candidates_considered=3,
+    ))
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    events: list[tuple[str, dict]] = []
+    real_info = sc.logger.info
+
+    def _spy(event, *args, **kw):
+        events.append((event, kw))
+        return real_info(event, *args, **kw)
+
+    monkeypatch.setattr(sc.logger, "info", _spy)
+
+    await sc._scan_for_entries(j, state)
+    no_spread = [e for e in events if e[0] == "scan.no_spread"]
+    assert len(no_spread) >= 1, f"expected scan.no_spread event, got {[e[0] for e in events]}"
+    assert no_spread[0][1].get("reasons") == ["test_forced_none"]
+    assert no_spread[0][1].get("candidates_considered") == 3
+    j.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_for_entries_emits_entry_rejected_when_pricing_bad(
+    tmp_path, make_state, monkeypatch,
+):
+    """If entry_quote is unacceptable we must log scan.entry_rejected with
+    the pricing reasons."""
+    j = Journal(str(tmp_path / "s.duckdb"))
+    state = make_state(asof=_et_utc(11, 0))
+
+    from zeroday_paper.engine.pricing import EntryQuote
+    bad_quote = EntryQuote(
+        credit_bid=-0.05, credit_mid=0.10, max_loss_bid=25.0,
+        credit_ratio=-0.002, is_acceptable=False,
+        reasons=["credit_bid -0.05 < 0.1"],
+    )
+    monkeypatch.setattr(sc, "entry_quote", lambda spread: bad_quote)
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    events: list[tuple[str, dict]] = []
+    real_info = sc.logger.info
+
+    def _spy(event, *args, **kw):
+        events.append((event, kw))
+        return real_info(event, *args, **kw)
+
+    monkeypatch.setattr(sc.logger, "info", _spy)
+
+    await sc._scan_for_entries(j, state)
+    rejects = [e for e in events if e[0] == "scan.entry_rejected"]
+    assert rejects, f"expected scan.entry_rejected, got events={[e[0] for e in events]}"
+    j.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_for_entries_emits_score_metric(tmp_path, make_state, monkeypatch):
+    """Numeric scan.score.<strategy> CloudWatch metric must be emitted on every
+    scan so we can graph score trend regardless of whether anything was written."""
+    j = Journal(str(tmp_path / "s.duckdb"))
+    state = make_state(asof=_et_utc(11, 0))
+
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    metric_calls: list[tuple[str, float]] = []
+    monkeypatch.setattr(sc, "emit_metric", lambda name, value=1.0, **kw: metric_calls.append((name, value)))
+
+    await sc._scan_for_entries(j, state)
+    metric_names = [m[0] for m in metric_calls]
+    assert "scan.score.bull_put" in metric_names
+    assert "scan.score.bear_call" in metric_names
+    # Each should be a non-negative numeric score.
+    for name, value in metric_calls:
+        if name.startswith("scan.score."):
+            assert value >= 0
+    j.close()
+
+
+# ------------------------------------------------- diagnostic_snapshot (MODE=diag)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_snapshot_returns_full_dict(monkeypatch, make_chain, make_vols, make_signals):
+    """diagnostic_snapshot must return a JSON-friendly dict with score, proximity,
+    chain stats, and per-strategy selection — and must NOT touch the journal."""
+    chain = make_chain()
+    signals = make_signals()
+    vols = make_vols()
+
+    class _FakePolygon:
+        def __init__(self, *_, **__): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def get_chain_snapshot(self, e, **kw): return chain
+
+    class _FakeCboe:
+        def __init__(self, *_, **__): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def get_live_snapshot(self): return vols
+
+    class _FakeFlashAlpha:
+        def __init__(self, *_, **__): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def get_signals(self, sym="SPX"): return signals
+
+    monkeypatch.setattr(sc, "PolygonClient", _FakePolygon)
+    monkeypatch.setattr(sc, "CboeClient", _FakeCboe)
+    monkeypatch.setattr(sc, "FlashAlphaClient", _FakeFlashAlpha)
+    monkeypatch.setattr(sc, "next_spx_expiry", lambda d: chain.expiry)
+    monkeypatch.setattr(sc, "classify_layer2", AsyncMock(return_value=[]))
+
+    fake_now = _et_utc(11, 30)
+
+    class _PatchedDT:
+        @staticmethod
+        def now(tz=None):
+            return fake_now
+    monkeypatch.setattr(sc, "datetime", _PatchedDT)
+
+    snap = await sc.diagnostic_snapshot()
+    assert isinstance(snap, dict)
+    assert "threshold" in snap
+    assert "chain" in snap
+    assert "signals" in snap
+    assert "proximity" in snap
+    assert "strategies" in snap
+    assert len(snap["strategies"]) == 2
+    for st in snap["strategies"]:
+        assert "score" in st
+        assert "breakdown" in st
+        assert "clears_threshold" in st
+        assert "selection" in st
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_snapshot_handles_chain_failure(monkeypatch, make_vols):
+    """Snapshot must degrade gracefully — record the error and still return JSON."""
+    vols = make_vols()
+
+    class _FakePolygon:
+        def __init__(self, *_, **__): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def get_chain_snapshot(self, e, **kw): raise RuntimeError("polygon down")
+
+    class _FakeCboe:
+        def __init__(self, *_, **__): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def get_live_snapshot(self): return vols
+
+    monkeypatch.setattr(sc, "PolygonClient", _FakePolygon)
+    monkeypatch.setattr(sc, "CboeClient", _FakeCboe)
+    monkeypatch.setattr(sc, "next_spx_expiry", lambda d: _et_utc(11, 30).date())
+
+    fake_now = _et_utc(11, 30)
+
+    class _PatchedDT:
+        @staticmethod
+        def now(tz=None):
+            return fake_now
+    monkeypatch.setattr(sc, "datetime", _PatchedDT)
+
+    snap = await sc.diagnostic_snapshot()
+    assert isinstance(snap, dict)
+    assert any("chain_failed" in e for e in snap["errors"])
+
+
 @pytest.mark.asyncio
 async def test_run_live_loop_cycle_exception_is_swallowed(monkeypatch):
     """A cycle error should not crash the loop; heartbeats record the error."""

@@ -5,6 +5,7 @@
 #   MODE=replay   → zp-replay  (one-shot historical fill)
 #   MODE=report   → zp-report  (build + post daily report)
 #   MODE=morning  → zp-morning (build + post pre-market brief)
+#   MODE=diag     → zp-diag    (one-shot read-only state + score dump)
 #
 # Any extra args are forwarded.
 set -euo pipefail
@@ -24,6 +25,9 @@ case "$MODE" in
     ;;
   morning)
     exec zp-morning "$@"
+    ;;
+  diag)
+    exec zp-diag "$@"
     ;;
   *)
     echo "[entrypoint] unknown MODE: $MODE" >&2

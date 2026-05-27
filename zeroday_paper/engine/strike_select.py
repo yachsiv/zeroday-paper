@@ -55,21 +55,47 @@ def _select_credit_spread(
     tol = cfg.default_short_delta_tolerance
     width = _adjusted_width(cfg.default_spread_width, vix_1d)
 
-    # Stage 1: short delta candidates (delta is negative for puts; abs comparison)
+    have_any_delta = any(q.delta is not None for q in quotes)
+
+    selector_used = "delta_band"
     shorts_s1: list[OptionQuote] = []
-    for q in quotes:
-        if q.delta is None or q.strike <= 0:
-            continue
-        d = abs(q.delta)
-        if (target - tol) <= d <= (target + tol):
-            shorts_s1.append(q)
-    if not shorts_s1:
-        return SelectionResult(None, ["no_short_in_delta_band"], 0)
+    if have_any_delta:
+        # Stage 1: short delta candidates (delta is negative for puts; abs comparison)
+        for q in quotes:
+            if q.delta is None or q.strike <= 0:
+                continue
+            d = abs(q.delta)
+            if (target - tol) <= d <= (target + tol):
+                shorts_s1.append(q)
+        if not shorts_s1:
+            # Delta values are present but no strike sits inside the delta band.
+            # Fall back to moneyness so we still produce a candidate. This is
+            # critical when Polygon returns greeks only for the deep-ITM/ATM
+            # strikes (free-tier behavior) and leaves the OTM short-leg
+            # candidates with delta=None.
+            shorts_s1 = _moneyness_shorts(quotes, state.spot, side)
+            if not shorts_s1:
+                return SelectionResult(
+                    None,
+                    ["no_short_in_delta_band", "no_short_in_moneyness_band"],
+                    0,
+                )
+            selector_used = "moneyness_fallback_partial_greeks"
+    else:
+        # No greeks at all — moneyness fallback only path.
+        shorts_s1 = _moneyness_shorts(quotes, state.spot, side)
+        if not shorts_s1:
+            return SelectionResult(None, ["no_short_in_moneyness_band_no_greeks"], 0)
+        selector_used = "moneyness_fallback_no_greeks"
 
     # Stage 2: quality gates on short leg
     shorts_s2 = [q for q in shorts_s1 if _is_quality(q, cfg.min_short_oi, cfg.max_bid_ask_spread_dollars)]
     if not shorts_s2:
-        return SelectionResult(None, ["all_shorts_failed_quality"], len(shorts_s1))
+        return SelectionResult(
+            None,
+            [f"all_shorts_failed_quality:selector={selector_used}"],
+            len(shorts_s1),
+        )
 
     strategy = StrategyType.BULL_PUT if side == "put" else StrategyType.BEAR_CALL
 
@@ -90,15 +116,51 @@ def _select_credit_spread(
         candidates.append((spread, eq.credit_ratio))
 
     if not candidates:
-        return SelectionResult(None, ["no_pair_with_acceptable_entry"], len(shorts_s2))
+        return SelectionResult(
+            None,
+            [f"no_pair_with_acceptable_entry:selector={selector_used}"],
+            len(shorts_s2),
+        )
 
     candidates.sort(key=lambda c: c[1], reverse=True)
     best, ratio = candidates[0]
     return SelectionResult(
         spread=best,
-        reasons=[f"selected ratio={ratio:.3f}"],
+        reasons=[f"selected ratio={ratio:.3f} selector={selector_used}"],
         candidates_considered=len(candidates),
     )
+
+
+def _moneyness_shorts(
+    quotes: list[OptionQuote],
+    spot: float,
+    side: str,
+) -> list[OptionQuote]:
+    """Pick short-leg candidates by distance from spot when delta is unusable.
+
+    18-delta short on SPX 0DTE is typically ~0.5-1.0% OTM. We anchor the band
+    at 0.6% OTM with a +/-35-point tolerance (~ 0.5 sigma at VIX1D=15). For
+    SPX=7500 that's a target strike of 7455 +/- 35, which usually contains
+    several listed strikes (5-pt spacing on SPX 0DTE).
+
+    Rejects strikes that aren't strictly OTM (we never sell ITM credit spreads).
+    """
+    if spot <= 0:
+        return []
+    target_distance = max(20.0, spot * 0.006)  # ~0.6% OTM
+    tol_distance = 35.0
+    target_strike = spot - target_distance if side == "put" else spot + target_distance
+    out: list[OptionQuote] = []
+    for q in quotes:
+        if q.strike <= 0:
+            continue
+        if side == "put" and q.strike >= spot:
+            continue
+        if side == "call" and q.strike <= spot:
+            continue
+        if abs(q.strike - target_strike) <= tol_distance:
+            out.append(q)
+    return out
 
 
 def _select_iron_condor(state: MarketState, *, vix_1d: float | None) -> SelectionResult:

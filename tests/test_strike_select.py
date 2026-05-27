@@ -126,10 +126,14 @@ def test_select_for_unsupported_strategy_returns_none(make_state):
     assert any("unsupported" in r for r in result.reasons)
 
 
-def test_select_for_no_short_in_delta_band_when_chain_empty(make_chain, make_state):
-    # Force chain with strikes outside delta band
+def test_select_for_falls_back_to_moneyness_when_delta_missing(make_chain, make_state):
+    """Polygon free-tier returns greeks=None on many strikes. The selector must
+    fall back to a moneyness-based picker so we still produce a candidate
+    spread instead of silently returning no_short_in_delta_band.
+
+    Regression for 2026-05-27 "0 paper trades for 2 sessions" incident."""
     chain = make_chain()
-    bad_puts = [
+    no_delta_puts = [
         type(q)(
             contract=q.contract, strike=q.strike, right=q.right, expiry=q.expiry,
             bid=q.bid, ask=q.ask, mid=q.mid, last=q.last,
@@ -138,14 +142,44 @@ def test_select_for_no_short_in_delta_band_when_chain_empty(make_chain, make_sta
         )
         for q in chain.puts
     ]
-    bad_chain = type(chain)(
+    no_delta_chain = type(chain)(
         fetched_at=chain.fetched_at, spot=chain.spot, expiry=chain.expiry,
-        calls=chain.calls, puts=bad_puts,
+        calls=chain.calls, puts=no_delta_puts,
     )
-    state = make_state(chain=bad_chain)
+    state = make_state(chain=no_delta_chain)
+    result = select_for(StrategyType.BULL_PUT, state)
+    assert result.spread is not None, (
+        f"moneyness fallback should pick a strike when delta is None; reasons={result.reasons}"
+    )
+    assert "moneyness_fallback" in " ".join(result.reasons)
+    # Short must be strictly OTM (strike < spot) for a bull put.
+    assert result.spread.short_leg.strike < state.spot
+
+
+def test_select_for_returns_none_when_no_strikes_near_spot(make_chain, make_state):
+    """If the chain has neither delta nor any strikes near spot, both selectors
+    fail and we surface both reasons so the operator can see it."""
+    # Chain is centered at 5800; put spot at 7000 so no strike is within the
+    # moneyness band either.
+    chain = make_chain(spot=5800.0)
+    no_delta_puts = [
+        type(q)(
+            contract=q.contract, strike=q.strike, right=q.right, expiry=q.expiry,
+            bid=q.bid, ask=q.ask, mid=q.mid, last=q.last,
+            iv=q.iv, delta=None, gamma=q.gamma, theta=q.theta, vega=q.vega,
+            open_interest=q.open_interest, volume=q.volume,
+        )
+        for q in chain.puts
+    ]
+    no_delta_chain = type(chain)(
+        fetched_at=chain.fetched_at, spot=chain.spot, expiry=chain.expiry,
+        calls=chain.calls, puts=no_delta_puts,
+    )
+    # Spot way above all the chain strikes → no put is within 35pt of target_strike
+    state = make_state(spot=7000.0, chain=no_delta_chain)
     result = select_for(StrategyType.BULL_PUT, state)
     assert result.spread is None
-    assert "no_short_in_delta_band" in result.reasons
+    assert any("no_short_in_moneyness_band" in r for r in result.reasons)
 
 
 def test_select_for_quality_gate_rejects_low_oi(make_chain, make_state, make_quote):
@@ -168,7 +202,7 @@ def test_select_for_quality_gate_rejects_low_oi(make_chain, make_state, make_quo
     state = make_state(chain=bad_chain)
     result = select_for(StrategyType.BULL_PUT, state)
     assert result.spread is None
-    assert "all_shorts_failed_quality" in result.reasons
+    assert any("all_shorts_failed_quality" in r for r in result.reasons)
 
 
 def test_select_for_ranks_by_credit_ratio(make_state):

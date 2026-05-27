@@ -118,7 +118,28 @@ class PolygonClient:
             self._client = None
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Issue a GET request honoring querystring inside ``path``.
+
+        ``next_url`` cursors that Polygon returns contain the cursor as a
+        querystring parameter. When passed as the ``path`` argument to
+        ``httpx.AsyncClient`` with ``base_url`` set, httpx **drops** that
+        querystring silently — so every paginated page was refetching page 1
+        and we never advanced. Detected via the 2026-05-27 diag run that
+        returned 4 puts where 246 existed.
+
+        Workaround: if ``path`` contains a ``?``, split it and merge the
+        querystring into ``params``. This preserves the cursor across pages.
+        """
         assert self._client is not None, "use as async context manager"
+        request_path = path
+        request_params: dict[str, Any] = dict(params or {})
+        if "?" in path:
+            request_path, qs = path.split("?", 1)
+            from urllib.parse import parse_qsl
+            for k, v in parse_qsl(qs, keep_blank_values=True):
+                # Don't override caller-passed params, but seed missing keys
+                # from the cursor URL.
+                request_params.setdefault(k, v)
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
@@ -126,7 +147,7 @@ class PolygonClient:
             reraise=True,
         ):
             with attempt:
-                resp = await self._client.get(path, params=params or {})
+                resp = await self._client.get(request_path, params=request_params)
                 if resp.status_code in (401, 403):
                     raise PolygonAuthError(f"Polygon rejected key: {resp.status_code}")
                 resp.raise_for_status()

@@ -48,7 +48,10 @@ def configure_logging() -> None:
         cache_logger_on_first_use=True,
     )
 
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
+    # Route stdlib logs to stderr so CLI tools that emit data on stdout
+    # (e.g. ``zp-diag``) produce clean output. CloudWatch captures both
+    # streams equally so AWS observability is unaffected.
+    logging.basicConfig(format="%(message)s", stream=sys.stderr, level=level)
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

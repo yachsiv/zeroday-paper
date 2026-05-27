@@ -203,9 +203,9 @@ async def test_classify_layer2_returns_parsed_matches(make_state, monkeypatch):
     out = await classify_layer2(make_state())
     assert len(out) == 2
     assert out[0].pattern_id == "P01"
-    assert out[0].score_bonus == 1  # 0.85 >= 0.75
+    assert out[0].score_bonus == 1  # 0.85 >= 0.65 (lowered 2026-05-27)
     assert out[1].pattern_id == "P02"
-    assert out[1].score_bonus == 0  # 0.70 < 0.75
+    assert out[1].score_bonus == 1  # 0.70 >= 0.65 — was 0 under old 0.75 cut
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,7 @@ zp-replay  = "zeroday_paper.cli.run_replay:main"
 zp-live    = "zeroday_paper.cli.run_live:main"
 zp-report  = "zeroday_paper.cli.run_report:main"
 zp-morning = "zeroday_paper.cli.run_morning:main"
+zp-diag    = "zeroday_paper.cli.run_diag:main"
 
 [build-system]
 requires = ["hatchling>=1.21"]

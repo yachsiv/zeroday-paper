@@ -491,6 +491,68 @@ async def test_polygon_get_chain_snapshot_paginates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_polygon_get_chain_snapshot_preserves_cursor_across_pages(monkeypatch):
+    """Regression: pagination must forward the cursor from next_url into the
+    next request. Without the fix, ``httpx`` silently drops the querystring
+    embedded in the path when ``base_url`` is set, so pages 2+ refetched
+    page 1 and the chain came back missing ~all puts.
+
+    Detected via the 2026-05-27 diag run (calls=436, puts=4).
+    """
+    seen_cursors: list[str | None] = []
+
+    page_1 = {
+        "results": [
+            {
+                "details": {"ticker": "O:C1", "strike_price": 5800, "contract_type": "call"},
+                "last_quote": {"bid": 1.0, "ask": 1.2},
+                "open_interest": 100, "day": {"volume": 10},
+                "greeks": {}, "implied_volatility": 0.2,
+            },
+        ],
+        "next_url": "https://api.polygon.io/v3/snapshot/options/SPX?cursor=CURSOR_ABC&expiration_date=2025-05-28&limit=250",
+    }
+    page_2 = {
+        "results": [
+            {
+                "details": {"ticker": "O:P1", "strike_price": 5790, "contract_type": "put"},
+                "last_quote": {"bid": 0.5, "ask": 0.7},
+                "open_interest": 200, "day": {"volume": 5},
+                "greeks": {}, "implied_volatility": 0.21,
+            },
+        ],
+        "next_url": None,
+    }
+
+    state = {"page": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "/v3/snapshot/options/" in str(req.url):
+            cursor = req.url.params.get("cursor")
+            seen_cursors.append(cursor)
+            i = state["page"]
+            state["page"] += 1
+            return httpx.Response(200, json=page_1 if i == 0 else page_2)
+        return httpx.Response(404)
+
+    _install_transport(monkeypatch, handler)
+    async with PolygonClient(api_key="x") as c:
+        snap = await c.get_chain_snapshot(date(2025, 5, 28))
+
+    # Two pages worth of requests
+    assert state["page"] == 2
+    # Page 1 had no cursor; page 2 must have forwarded the cursor from next_url
+    assert seen_cursors[0] is None
+    assert seen_cursors[1] == "CURSOR_ABC", (
+        f"page 2 must forward cursor=CURSOR_ABC but got {seen_cursors[1]!r}; "
+        "this is the 2026-05-27 pagination regression"
+    )
+    # And both pages' quotes survive into the chain
+    assert len(snap.calls) == 1
+    assert len(snap.puts) == 1
+
+
+@pytest.mark.asyncio
 async def test_polygon_get_chain_snapshot_with_spot_override_skips_derivation(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         if "/v3/snapshot/options/" in str(req.url):

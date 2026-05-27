@@ -27,7 +27,7 @@ from zeroday_paper.data.flashalpha_client import (
     signals_from_chain,
 )
 from zeroday_paper.data.polygon_client import PolygonClient, next_spx_expiry
-from zeroday_paper.engine.gex_levels import compute_rr25
+from zeroday_paper.engine.gex_levels import compute_proximity, compute_rr25
 from zeroday_paper.engine.gex_patterns import classify_layer1
 from zeroday_paper.engine.gex_patterns_llm import classify_layer2
 from zeroday_paper.engine.journal import Journal, trade_id_for
@@ -194,7 +194,21 @@ async def _monitor_open_positions(
 
 
 async def _scan_for_entries(journal: Journal, state: MarketState) -> int:
-    """Score all strategies, write any that clear threshold + caps."""
+    """Score all strategies, write any that clear threshold + caps.
+
+    Emits a verbose audit trail on every scan so we can never fly blind on
+    why no trade is being written:
+
+        scan.score             — per-strategy score breakdown + proximity
+        scan.below_threshold   — score did not clear settings.engine.score_threshold
+        scan.no_spread         — strike_select returned no spread (reasons attached)
+        scan.entry_rejected    — pricing rejected the spread (reasons attached)
+        scan.entry             — happy-path entry written
+        scan.layer2_failed     — LLM classifier raised (already existed)
+
+    Also emits CloudWatch metrics ``scan.score.<strategy>`` so the score trend
+    can be graphed even when nothing is written.
+    """
     l1_matches = classify_layer1(state)
     l1_hits = [
         PatternHit(
@@ -221,21 +235,73 @@ async def _scan_for_entries(journal: Journal, state: MarketState) -> int:
     today = state.asof.astimezone(ET).date()
     today_total = journal.count_today(today, source="live")
 
+    prox = compute_proximity(state)
+    signals_source = state.signals.source
+
     written = 0
     for strategy in (StrategyType.BULL_PUT, StrategyType.BEAR_CALL):
         if today_total + written >= settings.concurrency.max_concurrent_total:
+            logger.info(
+                "scan.cap_reached",
+                strategy=str(strategy),
+                today_total=today_total, written=written,
+                cap=settings.concurrency.max_concurrent_total,
+            )
             break
 
         score = score_state(state, strategy, l1_hits=l1_hits, l2_hits=l2_hits)
+        score_log_fields = {
+            "strategy": str(strategy),
+            "total": score.total,
+            "breakdown": score.breakdown,
+            "regime_ok": score.regime_ok,
+            "notes": score.notes,
+            "threshold": settings.engine.score_threshold,
+            "signals_source": signals_source,
+            "spot": state.spot,
+            "to_put_wall": prox.to_put_wall,
+            "to_call_wall": prox.to_call_wall,
+            "to_flip": prox.to_gamma_flip,
+            "above_flip": prox.above_flip,
+            "pin_score": state.signals.pin_score,
+            "vix_1d": state.vols.vix_1d,
+            "l1_hits": [h.pattern_id for h in l1_hits],
+            "l2_hits": [h.pattern_id for h in l2_hits],
+        }
+        logger.info("scan.score", **score_log_fields)
+        # Metric: score per strategy (numeric, no dims to keep cardinality low).
+        emit_metric(f"scan.score.{strategy.name.lower()}", float(score.total))
+
         if score.total < settings.engine.score_threshold:
+            logger.info("scan.below_threshold", **score_log_fields)
             continue
 
         sel = select_for(strategy, state)
         if sel.spread is None:
+            logger.info(
+                "scan.no_spread",
+                strategy=str(strategy),
+                score=score.total,
+                reasons=sel.reasons,
+                candidates_considered=sel.candidates_considered,
+                signals_source=signals_source,
+                spot=state.spot,
+            )
             continue
 
         eq = entry_quote(sel.spread)
         if not eq.is_acceptable:
+            logger.info(
+                "scan.entry_rejected",
+                strategy=str(strategy),
+                score=score.total,
+                reasons=eq.reasons,
+                short=sel.spread.short_leg.strike,
+                long=sel.spread.long_leg.strike,
+                credit_bid=eq.credit_bid,
+                credit_mid=eq.credit_mid,
+                signals_source=signals_source,
+            )
             continue
 
         entry_minute = state.asof.astimezone(ET).hour * 60 + state.asof.astimezone(ET).minute
@@ -290,9 +356,159 @@ async def _scan_for_entries(journal: Journal, state: MarketState) -> int:
                 strategy=str(strategy), score=score.total,
                 credit_bid=eq.credit_bid, short=t.short_strike, long=t.long_strike,
                 patterns_l1=t.active_patterns_l1, patterns_l2=t.active_patterns_l2,
+                signals_source=signals_source,
             )
 
     return written
+
+
+# -----------------------------------------------------------------------------
+# Diagnostic snapshot (MODE=diag)
+# -----------------------------------------------------------------------------
+
+
+async def diagnostic_snapshot() -> dict:
+    """Run one read-only cycle and return a JSON-friendly diagnostic snapshot.
+
+    Used by ``zp-diag`` to produce an "ssh into the running system" view:
+    full state, score breakdown, proximity, strike selection, entry-quote, all
+    in one shot. Does NOT write to the journal — pure read.
+    """
+    now = datetime.now(UTC)
+    expiry = next_spx_expiry(now.astimezone(ET).date())
+
+    snapshot: dict = {
+        "asof_utc": now.isoformat(),
+        "asof_et": now.astimezone(ET).isoformat(),
+        "expiry": expiry.isoformat(),
+        "threshold": settings.engine.score_threshold,
+        "errors": [],
+    }
+
+    async with PolygonClient() as polygon, CboeClient() as cboe:
+        try:
+            vols = await cboe.get_live_snapshot()
+        except Exception as exc:
+            snapshot["errors"].append(f"vols_failed:{exc}")
+            return snapshot
+        snapshot["vols"] = {"vix_1d": vols.vix_1d, "cboe_skew": vols.cboe_skew}
+
+        try:
+            chain = await polygon.get_chain_snapshot(expiry)
+        except Exception as exc:
+            snapshot["errors"].append(f"chain_failed:{exc}")
+            return snapshot
+
+        signals: MarketSignals
+        try:
+            async with FlashAlphaClient() as fa:
+                signals = await fa.get_signals("SPX")
+                if signals.spot <= 0:
+                    signals = signals_from_chain(chain)
+                    snapshot["errors"].append("flashalpha_spot_zero_fallback")
+        except Exception as exc:
+            snapshot["errors"].append(f"flashalpha_failed:{exc}")
+            signals = signals_from_chain(chain)
+
+        if chain.spot <= 0:
+            snapshot["errors"].append("spot_unresolved")
+            return snapshot
+
+        state = MarketState(asof=now, chain=chain, signals=signals, vols=vols, spot=chain.spot)
+        prox = compute_proximity(state)
+
+        # Chain metadata: do any quotes have delta?
+        all_qs = chain.calls + chain.puts
+        with_delta = [q for q in all_qs if q.delta is not None]
+        snapshot["chain"] = {
+            "spot": chain.spot,
+            "calls": len(chain.calls),
+            "puts": len(chain.puts),
+            "with_delta": len(with_delta),
+            "without_delta": len(all_qs) - len(with_delta),
+            "atm_strike": chain.atm_strike(),
+        }
+        snapshot["signals"] = {
+            "source": signals.source,
+            "regime": signals.gamma_regime,
+            "spot": signals.spot,
+            "gamma_flip": signals.gamma_flip,
+            "call_wall": signals.call_wall,
+            "put_wall": signals.put_wall,
+            "magnet_strike": signals.magnet_strike,
+            "pin_score": signals.pin_score,
+            "total_gex_b": signals.total_gex,
+        }
+        snapshot["proximity"] = {
+            "to_put_wall": prox.to_put_wall,
+            "to_call_wall": prox.to_call_wall,
+            "to_flip": prox.to_gamma_flip,
+            "to_magnet": prox.to_magnet,
+            "above_flip": prox.above_flip,
+        }
+
+        # Run pattern classifiers (read-only).
+        l1 = classify_layer1(state)
+        l1_hits = [
+            PatternHit(
+                pattern_id=m.pattern_id, name=m.name, direction=m.direction,
+                confidence=str(m.confidence), layer="L1_RULES", score_bonus=m.score_bonus,
+            )
+            for m in l1
+        ]
+        l2_hits: list[PatternHit] = []
+        if settings.patterns.layer_2_llm_enabled:
+            try:
+                l2 = await classify_layer2(state)
+                l2_hits = [
+                    PatternHit(
+                        pattern_id=m.pattern_id, name=m.name, direction=m.direction,
+                        confidence=str(m.confidence), layer="L2_LLM", score_bonus=m.score_bonus,
+                    )
+                    for m in l2
+                ]
+            except Exception as exc:
+                snapshot["errors"].append(f"layer2_failed:{exc}")
+        snapshot["patterns_l1"] = [h.pattern_id for h in l1_hits]
+        snapshot["patterns_l2"] = [h.pattern_id for h in l2_hits]
+
+        strategies_out: list[dict] = []
+        for strategy in (StrategyType.BULL_PUT, StrategyType.BEAR_CALL):
+            sc_res = score_state(state, strategy, l1_hits=l1_hits, l2_hits=l2_hits)
+            entry: dict = {
+                "strategy": str(strategy),
+                "score": sc_res.total,
+                "breakdown": sc_res.breakdown,
+                "regime_ok": sc_res.regime_ok,
+                "notes": sc_res.notes,
+                "clears_threshold": sc_res.total >= settings.engine.score_threshold,
+            }
+            sel = select_for(strategy, state)
+            entry["selection"] = {
+                "spread_found": sel.spread is not None,
+                "reasons": sel.reasons,
+                "candidates_considered": sel.candidates_considered,
+            }
+            if sel.spread is not None:
+                eq = entry_quote(sel.spread)
+                entry["selection"].update({
+                    "short_strike": sel.spread.short_leg.strike,
+                    "long_strike": sel.spread.long_leg.strike,
+                    "short_delta": sel.spread.short_leg.delta,
+                    "width": sel.spread.width,
+                })
+                entry["entry_quote"] = {
+                    "credit_bid": eq.credit_bid,
+                    "credit_mid": eq.credit_mid,
+                    "max_loss_bid": eq.max_loss_bid,
+                    "credit_ratio": eq.credit_ratio,
+                    "is_acceptable": eq.is_acceptable,
+                    "reasons": eq.reasons,
+                }
+            strategies_out.append(entry)
+        snapshot["strategies"] = strategies_out
+
+    return snapshot
 
 
 # -----------------------------------------------------------------------------
