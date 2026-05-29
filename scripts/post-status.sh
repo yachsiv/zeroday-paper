@@ -31,7 +31,7 @@ SUBNET_B="subnet-0f8fb515c6319eb93"
 
 TASK_SG=$(aws ec2 describe-security-groups \
   --region "$REGION" \
-  --filters "Name=group-name,Values=ZerodayPaperStack-TaskSg-*" \
+  --filters "Name=group-name,Values=ZerodayPaperStack-TaskSg*" \
   --query 'SecurityGroups[0].GroupId' --output text)
 
 echo "==> Launching status task (taskdef=$TASK_DEF_ARN sg=$TASK_SG)" >&2
