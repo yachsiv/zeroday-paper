@@ -107,3 +107,14 @@ def discord_webhook(key: str | None = None) -> str:
             f"Available keys: {list(data.keys())}"
         )
     return data[webhook_key]
+
+
+def discord_webhook_status() -> str:
+    """Discord webhook URL for on-demand MODE=status posts.
+
+    Convenience accessor mirroring ``discord_webhook_shadow`` (implicit via
+    ``discord_webhook()`` default) and ``discord_webhook_morning_brief``. The
+    underlying key is configurable in ``config/paper.toml``; the MVP shares
+    ``webhook_shadow`` with the daily report.
+    """
+    return discord_webhook(settings.reporting.status_discord_webhook_secret_key)

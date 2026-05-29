@@ -87,6 +87,12 @@ include_replay_summary_first_n_days = 7         # surface replay results for fir
 morning_brief_discord_webhook_secret_key = "webhook_morning_brief"
 morning_brief_hour_et = 8                        # 08:00 ET cron, EDT half of the year
 morning_brief_minute_et = 0
+# Webhook for on-demand MODE=status posts. MVP reuses webhook_shadow so we
+# don't have to touch the user's Discord setup; the daily report still posts
+# there too, just less frequently. To split into a dedicated channel, add a
+# new `webhook_status` key to the zeroday/discord secret and flip the value
+# here — no other code change required.
+status_discord_webhook_secret_key = "webhook_shadow"
 
 [morning_brief]
 enabled = true

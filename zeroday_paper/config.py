@@ -147,6 +147,9 @@ class ReportingConfig:
     morning_brief_discord_webhook_secret_key: str
     morning_brief_hour_et: int
     morning_brief_minute_et: int
+    # Default falls back to webhook_shadow so older config files without the
+    # new key keep working in dev environments / tests.
+    status_discord_webhook_secret_key: str = "webhook_shadow"
 
 
 @dataclass(frozen=True)
